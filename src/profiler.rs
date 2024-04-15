@@ -498,7 +498,7 @@ pub unsafe fn get_sizeof_object(profiler: &MonoProfiler, object: &MonoObject) ->
 	let klass = &(*(*object.vtable).klass);
 
 	match klass.class_kind {
-		MonoTypeKind::MonoClassDef | MonoTypeKind::MONO_CLASS_GTD | MonoTypeKind::MONO_CLASS_GINST => {
+		MonoTypeKind::ClassDef | MonoTypeKind::ClassGtd | MonoTypeKind::ClassGinst => {
 			if ptr::eq(klass, profiler.mono_defaults.string_class)
 			{
 				let mstr: &MonoString = transmute(object);
@@ -506,7 +506,7 @@ pub unsafe fn get_sizeof_object(profiler: &MonoProfiler, object: &MonoObject) ->
 			}
 			klass.instance_size as usize
 		},
-		MonoTypeKind::MONO_CLASS_ARRAY => {
+		MonoTypeKind::ClassArray => {
 			let arr: &MonoArray = transmute(object);
 			klass.instance_size as usize + (arr.length as usize * klass.sizes.element_size as usize)
 		},
