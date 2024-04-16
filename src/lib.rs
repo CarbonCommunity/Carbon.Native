@@ -1,6 +1,3 @@
-#![feature(sync_unsafe_cell)]
-#![feature(let_chains)]
-
 use std::ffi::{c_char, CStr};
 
 //mod compiler;
