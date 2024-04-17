@@ -316,8 +316,8 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 	if !td.main {return ProfilerResultCode::MainThreadOnly;}
 	let profiler = get_profiler!(ProfilerResultCode::NotInitialized);
 	match profiler.profiler_recording {
-		false => {log_mono_internal(Severity::Warning, "Profiler recording", LogSource::Profiler, 1);}
-		true => {log_mono_internal(Severity::Warning, "Profiler stopped", LogSource::Profiler, 1);}
+		false => {log_mono_internal(Severity::Warning, "Recording started..", LogSource::Profiler, 1);}
+		true => {log_mono_internal(Severity::Warning, "Finished recording", LogSource::Profiler, 1);}
 	}
 	let mut sync = profiler.sync.write().unwrap();
 	let mut basic_ret: Option<String> = None;
