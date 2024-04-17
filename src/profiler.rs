@@ -381,19 +381,19 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 				}
 				// Assembly, Total Time, Total time %, Calls, Memory allocated
 				let mut builder: Builder = Builder::with_capacity(data.len(), 5);
-				builder.push_record(["Plugin", "Total Time", "Total time %", "Calls", "Memory usage"]);
+				builder.push_record(["Assembly", "Total Time", "Total time %", "Calls", "Memory usage"]);
 				for result in plugin_data.into_values() {
 					builder.push_record([
 						result.name,
-						format!("{}ms", result.total_time.as_millis()),
-						format!("{}%", ((result.total_time.as_millis() as f64 / total_time) * 100f64).floor()),
+						format!("{}", result.total_time.as_millis()),
+						format!("{}", ((result.total_time.as_millis() as f64 / total_time) * 100f64).floor()),
 						format!("{}", result.calls),
-						ByteSize::b(result.allocations).to_string()
+						format!("{}", result.allocations)
 					]);
 				}
 
 
-				basic_ret = Some(builder.build().with(Style::psql()).to_string());
+				basic_ret = Some(builder.build().with(Style::empty()).to_string());
 			}
 			if gen_advanced
 			{
@@ -408,18 +408,18 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 					builder.push_record([
 						get_asm_from_method(&sync, &**method).to_string(),
 						get_method_full_name(&**method, MonoTypeNameFormat::FullName).to_string(),
-						format!("{}ms", result.total_time.as_millis()),
-						format!("{}%", ((result.total_time.as_millis() as f64 / total_time) * 100f64).floor()),
-						format!("{}ms", result.own_time.as_millis()),
-						format!("{}%", ((result.own_time.as_millis() as f64 / total_time) * 100f64).floor()),
+						format!("{}", result.total_time.as_millis()),
+						format!("{}", ((result.total_time.as_millis() as f64 / total_time) * 100f64).floor()),
+						format!("{}", result.own_time.as_millis()),
+						format!("{}", ((result.own_time.as_millis() as f64 / total_time) * 100f64).floor()),
 						format!("{}", result.calls),
-						ByteSize::b(result.total_allocations).to_string(),
-						ByteSize::b(result.own_allocations).to_string()
+						format!("{}", result.total_allocations),
+						format!("{}", result.own_allocations)
 					]);
 				}
 
 
-				adv_ret = Some(builder.build().with(Style::psql()).to_string());
+				adv_ret = Some(builder.build().with(Style::empty()).to_string());
 			}
 
 			data.clear();
