@@ -141,10 +141,16 @@ pub struct ProfilerConfig
 	pub enabled: bool,
 	#[serde(rename = "Allocations")]
 	pub allocations: bool,
-	#[serde(rename = "ProfiledAssemblies")]
+	#[serde(rename = "Assemblies")]
 	pub assemblies: Vec<String>,
-	#[serde(rename = "ProfiledPlugins")]
-	pub plugins: Vec<String>
+	#[serde(rename = "Plugins")]
+	pub plugins: Vec<String>,
+	#[serde(rename = "Modules")]
+	pub modules: Vec<String>,
+	#[serde(rename = "Extensions")]
+	pub extensions: Vec<String>,
+	#[serde(rename = "Harmony")]
+	pub harmony: Vec<String>
 }
 
 pub struct RuntimeData
