@@ -141,9 +141,9 @@ pub struct ProfilerConfig
 	pub enabled: bool,
 	#[serde(rename = "Allocations")]
 	pub allocations: bool,
-	#[serde(rename = "AssembliesToProfile")]
+	#[serde(rename = "ProfiledAssemblies")]
 	pub assemblies: Vec<String>,
-	#[serde(rename = "PluginsToProfile")]
+	#[serde(rename = "ProfiledPlugins")]
 	pub plugins: Vec<String>
 }
 
