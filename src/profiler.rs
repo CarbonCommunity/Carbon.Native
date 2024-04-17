@@ -142,7 +142,9 @@ pub struct ProfilerConfig
 	#[serde(rename = "Allocations")]
 	pub allocations: bool,
 	#[serde(rename = "AssembliesToProfile")]
-	pub assemblies: Vec<String>
+	pub assemblies: Vec<String>,
+	#[serde(rename = "PluginsToProfile")]
+	pub plugins: Vec<String>
 }
 
 pub struct RuntimeData
