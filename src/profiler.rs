@@ -13,7 +13,7 @@ use tabled::builder::Builder;
 use tabled::settings::Style;
 
 use crate::mono::*;
-use crate::{log_mono_internal, LogSource, run_ffi_safe, Severity};
+use crate::{log_mono_internal, LogSource, read_cstr, read_cstr_default, run_ffi_safe, Severity};
 
 thread_local! {
 	pub static THREAD_DATA: Cell<*mut ThreadData> = const { Cell::new(ptr::null_mut()) }
@@ -25,7 +25,7 @@ pub enum ProfilerResultCode
 	OK = 0,
 	MainThreadOnly = 1,
 	NotInitialized = 2,
-	_UnknownError = 3,
+	UnknownError = 3,
 }
 
 pub struct StackFrame
@@ -119,14 +119,18 @@ pub fn get_thread_data<'a>() -> &'a mut ThreadData
 pub struct MonoProfiler
 {
 	pub handle: MonoProfilerHandle,
-	pub sync: RwLock<()>,
+	pub sync: RwLock<ProfilerSynced>,
+	pub mono_defaults: MonoDefaults,
+	pub threads: Mutex<Vec<&'static mut ThreadData>>
+}
+
+pub struct ProfilerSynced
+{
 	pub config: ProfilerConfig,
 	pub profiler_images: HashMap<*const MonoImage, String>,
 	pub profiler_method_image_map: HashMap<*const MonoMethod, *const MonoImage>,
 	pub profiler_method_detour_map: HashMap<*const MonoMethod, *const MonoMethod>,
-	pub mono_defaults: MonoDefaults,
 	pub runtime: Option<RuntimeData>,
-	pub threads: Mutex<Vec<&'static mut ThreadData>>
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -202,13 +206,14 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 		
 		PROFILER = Some(MonoProfiler {
 			handle: ptr::null(),
-			sync: RwLock::new(()),
-			config: cfg,
-			profiler_images: Default::default(),
-			profiler_method_image_map: Default::default(),
-			profiler_method_detour_map: Default::default(),
+			sync: RwLock::new(ProfilerSynced {
+				config: cfg,
+				profiler_images: Default::default(),
+				profiler_method_image_map: Default::default(),
+				profiler_method_detour_map: Default::default(),
+				runtime: None,
+			}),
 			mono_defaults: MonoDefaults::new(),
-			runtime: None,
 			threads: Mutex::new(Vec::new())
 		});
 
@@ -218,7 +223,7 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 
 		mp.handle = mono_profiler_create(mp);
 
-		if mp.config.allocations { 
+		if mp.sync.read().unwrap().config.allocations { 
 			mono_profiler_enable_allocations();
 		}
 		mono_profiler_set_call_instrumentation_filter_callback(mp.handle, Some(can_profile_method));
@@ -255,7 +260,7 @@ pub const INST_FLAGS: CallInstrumentationFlags =
 pub unsafe extern "system" fn register_profiler_assembly(image_raw: *const MonoImage, strptr: *const u16, len: i32)
 {
 	let profiler = get_profiler!();
-	let lock = profiler.sync.write();
+	let mut sync = profiler.sync.write().unwrap();
 	if image_raw.is_null() {return;}
 	let image = &*image_raw;
 	let name: String = if strptr.is_null() || len < 1
@@ -270,28 +275,35 @@ pub unsafe extern "system" fn register_profiler_assembly(image_raw: *const MonoI
 	{
 		println!("registering assembly: {}", name);
 	}
-	profiler.profiler_images.insert(image, name);
-	
-	drop(lock);
+	sync.profiler_images.insert(image, name);
 }
 
 pub unsafe extern "C" fn image_loaded(profiler: &mut MonoProfiler, image: &MonoImage)
 {
-	let lock = profiler.sync.write().unwrap();
+	let mut sync = profiler.sync.write().unwrap();
 	
-	if image.assembly_name.is_null() {return;}
+	let name = read_cstr(image.assembly_name);
 	
-	let name: &str = CStr::from_ptr(image.assembly_name).to_str().unwrap();
-	
-	if profiler.config.assemblies.iter().any(|x|{
-		if x.eq("*") {return true;}
-		name.eq(x.as_str())
+	if sync.config.assemblies.iter().any(|cfg_name|{
+		if cfg_name.eq("*") {return true;}
+		match name {
+			None => false,
+			Some(asmname) => asmname.eq(cfg_name)
+		}
 	})
 	{
-		profiler.profiler_images.insert(image, name.to_string());
+		sync.profiler_images.insert(image, match name {
+			None => get_assembly_name(image),
+			Some(x) => x.to_string()
+		});
 	}
-	
-	drop(lock);
+}
+
+pub unsafe fn get_assembly_name(profiler: &MonoImage) -> String
+{
+	read_cstr_default(profiler.assembly_name, ||{
+		format!("__UNKNOWN: {:x}", transmute::<&MonoImage, usize>(profiler))
+	})
 }
 
 pub static mut PROFILER_RECORDING: bool = false;
@@ -299,6 +311,7 @@ pub static mut PROFILER_RECORDING: bool = false;
 #[no_mangle]
 pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bool, basic_out: *mut (), adv_out: *mut (), result_cb: extern "system" fn(*mut (), *const u8, i32)) -> ProfilerResultCode
 {
+	run_ffi_safe!("profiler_toggle", ProfilerResultCode::UnknownError, {
 	let td = get_thread_data();
 	if !td.main {return ProfilerResultCode::MainThreadOnly;}
 	let profiler = get_profiler!(ProfilerResultCode::NotInitialized);
@@ -306,24 +319,24 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 		false => {log_mono_internal(Severity::Warning, "Profiler recording", LogSource::Profiler, 1);}
 		true => {log_mono_internal(Severity::Warning, "Profiler stopped", LogSource::Profiler, 1);}
 	}
-	let lock = profiler.sync.write().unwrap();
+	let mut sync = profiler.sync.write().unwrap();
 	let mut basic_ret: Option<String> = None;
 	let mut adv_ret: Option<String> = None;
 	match !PROFILER_RECORDING {
 		true => {
-			profiler.runtime = Some(RuntimeData
+			sync.runtime = Some(RuntimeData
 			{
 				started: Instant::now()
 			});
 			*state = true;
-			if profiler.config.allocations {
+			if sync.config.allocations {
 				mono_profiler_set_gc_allocation_callback(profiler.handle, Some(gc_alloc_cb));
 			}
 			PROFILER_RECORDING = true;
 		}
 		false => {
 			PROFILER_RECORDING = false;
-			if profiler.config.allocations {
+			if sync.config.allocations {
 				mono_profiler_set_gc_allocation_callback(profiler.handle, None);
 			}
 			//println!("Profile complete");
@@ -331,7 +344,7 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 			// TODO: do this the right way
 			thread::sleep(Duration::from_millis(50));
 			
-			let rt = mem::take(&mut profiler.runtime).unwrap();
+			let rt = mem::take(&mut sync.runtime).unwrap();
 			
 			let mut data = mem::take(&mut td.recording);
 			
@@ -352,11 +365,11 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 			{
 				// BASIC
 				// Assembly, Total Time, Total Time %, Calls, Memory usage
-				let mut plugin_data: HashMap<*const MonoImage, PluginResults> = HashMap::with_capacity(profiler.profiler_images.len());
+				let mut plugin_data: HashMap<*const MonoImage, PluginResults> = HashMap::with_capacity(sync.profiler_images.len());
 				for (method, method_results) in data.iter_mut() {
 					let entry = plugin_data.entry((*(**method).class).image).or_insert_with(||{
 						PluginResults {
-							name: get_asm_from_method(profiler, &**method),
+							name: get_asm_from_method(&sync, &**method),
 							calls: 0,
 							allocations: 0,
 							total_time: Duration::ZERO
@@ -393,7 +406,7 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 				builder.push_record(["Assembly", "Method", "Total Time", "Total time %", "Own time", "Own time %", "Calls", "Total Alloc", "Own Alloc"]);
 				for (method, result) in data.iter_mut() {
 					builder.push_record([
-						get_asm_from_method(profiler, &**method).to_string(),
+						get_asm_from_method(&sync, &**method).to_string(),
 						get_method_full_name(&**method, MonoTypeNameFormat::FullName).to_string(),
 						format!("{}ms", result.total_time.as_millis()),
 						format!("{}%", ((result.total_time.as_millis() as f64 / total_time) * 100f64).floor()),
@@ -415,7 +428,6 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 			*state = false;
 		}
 	}
-	drop(lock);
 	if let Some(rstr) = basic_ret
 	{
 		result_cb(basic_out, rstr.as_ptr(), rstr.len() as i32);
@@ -425,13 +437,14 @@ pub unsafe extern "system" fn profiler_toggle(gen_advanced: bool, state: &mut bo
 		result_cb(adv_out, rstr.as_ptr(), rstr.len() as i32);
 	}
 	ProfilerResultCode::OK
+	})
 }
 
-pub unsafe fn get_asm_from_method<'a>(profiler: &'a MonoProfiler, method: &'a MonoMethod) -> String
+pub unsafe fn get_asm_from_method<'a>(profiler: &'a ProfilerSynced, method: &'a MonoMethod) -> String
 {
 	let image = (*method.class).image;
 	match profiler.profiler_images.get(&image) {
-		None => CStr::from_ptr((*image).name).to_str().unwrap().to_string(),
+		None => get_assembly_name(&*image),
 		Some(x) => {
 			x.clone()
 		}
@@ -464,8 +477,8 @@ pub unsafe extern "C" fn method_free(_profiler: &mut MonoProfiler, method: &Mono
 
 pub unsafe extern "C" fn can_profile_method(profiler: &mut MonoProfiler, mut method: &MonoMethod) -> CallInstrumentationFlags
 {
-	let lock = profiler.sync.read().unwrap();
-	match profiler.profiler_method_detour_map.get(&(method as *const MonoMethod))
+	let sync = profiler.sync.read().unwrap();
+	match sync.profiler_method_detour_map.get(&(method as *const MonoMethod))
 	{
 		None => {}
 		Some(x) => {
@@ -474,7 +487,7 @@ pub unsafe extern "C" fn can_profile_method(profiler: &mut MonoProfiler, mut met
 	}
 	if method.class.is_null() || (*method.class).image.is_null() {return CallInstrumentationFlags::None;}
 	let asm: *const MonoImage = (*method.class).image;
-	let ret  = if profiler.profiler_images.contains_key(&asm)
+	if sync.profiler_images.contains_key(&asm)
 	{
 		//debug_log_method(method);
 		INST_FLAGS
@@ -482,10 +495,7 @@ pub unsafe extern "C" fn can_profile_method(profiler: &mut MonoProfiler, mut met
 	else {
 		//debug_log_method(method);
 		CallInstrumentationFlags::None
-	};
-	
-	drop(lock);
-	ret
+	}
 }
 
 pub unsafe extern "C" fn method_enter(profiler: &mut MonoProfiler, method: *const MonoMethod, _ctx: *const MonoProfilerCallContext)
@@ -498,18 +508,18 @@ pub unsafe fn get_sizeof_object(profiler: &MonoProfiler, object: &MonoObject) ->
 	let klass = &(*(*object.vtable).klass);
 
 	match klass.class_kind {
-		MonoTypeKind::ClassDef | MonoTypeKind::ClassGtd | MonoTypeKind::ClassGinst => {
+		MonoTypeKind::Def | MonoTypeKind::Gtd | MonoTypeKind::Ginst => {
 			if ptr::eq(klass, profiler.mono_defaults.string_class)
 			{
 				let mstr: &MonoString = transmute(object);
 				return klass.instance_size as usize + (mstr.length as usize * 2)
 			}
 			klass.instance_size as usize
-		},
-		MonoTypeKind::ClassArray => {
+		}
+		MonoTypeKind::Array => {
 			let arr: &MonoArray = transmute(object);
 			klass.instance_size as usize + (arr.length as usize * klass.sizes.element_size as usize)
-		},
+		}
 		_ => {0}
 	}
 }

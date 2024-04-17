@@ -32,15 +32,20 @@ pub unsafe extern "system" fn log_message(level: Severity, verb: i32, ptr: *cons
 	}
 }
 
-pub unsafe fn read_cstr(ptr: *const c_char, default: impl FnOnce() -> String) -> String
+pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str>
 {
-	if ptr.is_null() 
-	{
-		default()
-	}
-	else {
-		CStr::from_ptr(ptr).to_str().unwrap().to_string()
-	}
+	return match ptr.is_null()  {
+		true => None,
+		false => Some(CStr::from_ptr(ptr).to_str().unwrap())
+	};
+}
+
+pub unsafe fn read_cstr_default(ptr: *const c_char, default: impl FnOnce() -> String) -> String
+{
+	return match read_cstr(ptr)  {
+		None => default(),
+		Some(x) => x.to_string()
+	};
 }
 
 pub fn log_mono_internal(severity: Severity, msg: &str, source: LogSource, verb: i32)

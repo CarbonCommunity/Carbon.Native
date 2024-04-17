@@ -151,19 +151,19 @@ pub fn get_method_full_name(method: &MonoMethod, format: MonoTypeNameFormat) -> 
 pub enum MonoTypeKind
 {
 	/// non-generic type
-	ClassDef = 1,
+	Def = 1,
 	/// generic type definition
-	ClassGtd,
+	Gtd,
 	/// generic instantiation
-	ClassGinst,
+	Ginst,
 	/// generic parameter
-	ClassGparam,
+	Gparam,
 	/// vector or array, bounded or not
-	ClassArray,
+	Array,
 	/// pointer or function pointer
-	ClassPointer,
+	Pointer,
 	/// not a real class kind - used for sgen nursery filler arrays
-	ClassGcFiller = 0xAC
+	GcFiller = 0xAC
 }
 
 #[repr(C)]
