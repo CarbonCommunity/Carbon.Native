@@ -81,6 +81,7 @@ bitflags! {
 	}
 }
 
+// RuntimeMethodHandle in C#
 #[repr(C)]
 pub struct MonoMethod
 {
@@ -433,6 +434,8 @@ pub struct MonoVTable
 	vtable: *const (),
 }
 pub type MonoImageStorage = ();
+
+// ModuleHandle in C#
 #[repr(C)]
 pub struct MonoImage
 {

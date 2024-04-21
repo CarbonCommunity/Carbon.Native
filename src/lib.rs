@@ -1,3 +1,5 @@
+#![feature(iter_collect_into)]
+
 use std::ffi::{c_char, CStr};
 
 //mod compiler;
@@ -6,6 +8,14 @@ use std::ffi::{c_char, CStr};
 //mod native_array_manager;
 mod profiler;
 mod mono;
+
+pub const PROTOCOL: u64 = 0;
+
+#[no_mangle]
+pub unsafe extern "system" fn carbon_get_protocol() -> u64
+{
+	PROTOCOL
+}
 
 #[inline]
 pub unsafe fn cptr_to_str<'a>(ptr: *mut c_char) -> &'a CStr
