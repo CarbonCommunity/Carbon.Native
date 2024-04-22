@@ -172,6 +172,7 @@ impl MethodResult
 		self.total_time += input.total_time;
 		self.own_time += input.own_time;
 		self.calls += input.calls;
+		self.total_allocations += input.total_allocations;
 		self.own_allocations += input.own_allocations;
 	}
 }
@@ -330,7 +331,7 @@ pub struct AdvancedRecord
 {
 	pub assembly_handle: *const MonoImage,
 	pub method_handle: *const MonoMethod,
-	pub method_name: *mut (),
+	pub method_name: *const MonoString,
 	pub total_time: u64,
 	pub total_time_percentage: f64,
 	pub own_time: u64,
@@ -359,12 +360,12 @@ impl Default for AdvancedRecord
 	}
 }
 
-pub type ManagedStringMarshalFunc = extern "system" fn(&mut *mut (), *const u8, i32);
+pub type ManagedStringMarshalFunc = extern "system" fn(&mut *const MonoString, *const u8, i32);
 pub type BasicIter<'a> = (Iter<'a, *const MonoImage, PluginResults>, f64);
 pub type AdvIter<'a> = (Iter<'a, *const MonoMethod, MethodResult>, ManagedStringMarshalFunc, f64);
 
 #[no_mangle]
-pub unsafe extern "system" fn get_image_name(managed: &mut *mut (), image: *const MonoImage, marshal: ManagedStringMarshalFunc)
+pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, image: *const MonoImage, marshal: ManagedStringMarshalFunc)
 {
 	if let Some(cs) = read_cstr((*image).assembly_name)
 	{

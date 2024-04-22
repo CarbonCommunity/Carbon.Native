@@ -338,6 +338,20 @@ pub struct MonoString
 	pub str: u16
 }
 
+impl MonoString
+{
+	pub fn get_string(&self) -> String
+	{
+		if self.length < 1
+		{
+			return String::new();
+		}
+		unsafe {
+			String::from_utf16(slice::from_raw_parts(&self.str, self.length as usize)).unwrap()
+		}
+	}
+}
+
 type MonoArraySize = u32;
 type MonoArrayLowerBound = i32;
 
