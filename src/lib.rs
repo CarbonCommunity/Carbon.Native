@@ -1,5 +1,3 @@
-#![feature(iter_collect_into)]
-
 use std::ffi::{c_char, CStr};
 
 //mod compiler;
