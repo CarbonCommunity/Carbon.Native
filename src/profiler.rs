@@ -549,8 +549,8 @@ pub unsafe extern "system" fn profiler_toggle(
 			}
 		}
 		match profiler.profiler_recording {
-			false => {log_mono_internal(Severity::Warning, "Recording started..", LogSource::Profiler, 1);}
-			true => {log_mono_internal(Severity::Warning, "Finished recording", LogSource::Profiler, 1);}
+			false => {log_mono_internal(Severity::Warning, "Finished recording", LogSource::Profiler, 1);}
+			true => {log_mono_internal(Severity::Warning, "Recording started..", LogSource::Profiler, 1);}
 		}
 		ProfilerResultCode::OK
 	});
