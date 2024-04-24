@@ -143,6 +143,8 @@ pub struct ProfilerConfig
 	pub enabled: bool,
 	#[serde(rename = "Allocations")]
 	pub allocations: bool,
+	#[serde(rename = "SourceViewer")]
+	pub sourceviewer: bool,
 	#[serde(rename = "Assemblies")]
 	pub assemblies: Vec<String>,
 	#[serde(rename = "Plugins")]
