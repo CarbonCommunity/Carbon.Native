@@ -15,7 +15,7 @@ extern "C" {
 	pub fn mono_profiler_enable_allocations() -> bool;
 	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoObject)>);
 	pub fn mono_profiler_set_image_loaded_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoImage)>);
-	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext)>);
+	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoMethod, *const MonoProfilerCallContext)>);
 	pub fn mono_profiler_set_method_tail_call_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoMethod)>);
 	pub fn mono_profiler_set_method_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext)>);
 	pub fn mono_profiler_set_method_exception_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoObject)>);
