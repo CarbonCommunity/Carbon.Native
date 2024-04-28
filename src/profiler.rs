@@ -550,10 +550,7 @@ pub unsafe extern "system" fn profiler_toggle(
 				td.call_recording = data;
 			}
 		}
-		match profiler.profiler_recording {
-			false => {log_mono_internal(Severity::Warning, "Finished recording", LogSource::Profiler, 1);}
-			true => {log_mono_internal(Severity::Warning, "Recording started..", LogSource::Profiler, 1);}
-		}
+
 		ProfilerResultCode::OK
 	});
 	unsafe extern "system" fn iter_basic_fn(
