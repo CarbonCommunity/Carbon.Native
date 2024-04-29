@@ -1,16 +1,16 @@
 use std::{fs, mem, ptr, slice, thread};
 use std::cell::Cell;
-use std::collections::hash_map::{Entry, Iter};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::{Entry, Iter};
 use std::ffi::CStr;
 use std::mem::transmute;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
-use bitflags::bitflags;
 
+use bitflags::bitflags;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::{log_mono_internal, LogSource, read_cstr, read_cstr_default, run_ffi_safe, Severity};
+use crate::{assert_main_domain, deref_or_ret, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret};
 use crate::mono::*;
 
 thread_local! {
@@ -21,10 +21,12 @@ thread_local! {
 pub enum ProfilerResultCode
 {
 	OK = 0,
-	Aborted = 1,
-	MainThreadOnly = 2,
-	NotInitialized = 3,
-	UnknownError = 4,
+	InvalidArgs = 1,
+	Aborted = 2,
+	MainThreadOnly = 3,
+	NotInitialized = 4,
+	CorruptedState = 5,
+	UnknownError = 6,
 }
 
 pub struct StackFrame
@@ -33,21 +35,6 @@ pub struct StackFrame
 	pub own_allocations: u64,
 	pub total_allocations: u64,
 	pub time: Option<StackTiming>,
-}
-
-macro_rules! get_profiler {
-    () => {
-		match &mut PROFILER {
-			None => return,
-			Some(x) => x
-		}
-	};
-	($default:expr) => {
-		match &mut PROFILER {
-			None => {return $default;},
-			Some(x) => x
-		}
-	};
 }
 
 pub struct StackTiming
@@ -84,17 +71,21 @@ pub struct ThreadData
 {
 	pub main: bool,
 	pub stack: Vec<StackFrame>,
+	pub domain: *const MonoDomain,
 	pub call_recording: HashMap<*const MonoMethod, MethodResult>,
-	//pub memory_recording: HashMap<*const MonoClass, MemoryResult>
+	pub memory_recording: HashMap<*const MonoClass, MemoryResult>
 }
 
 impl Default for ThreadData {
 	fn default() -> Self {
-		Self {
-			main: false,
-			stack: Vec::with_capacity(128),
-			call_recording: HashMap::with_capacity(128),
-			//memory_recording: HashMap::with_capacity(64)
+		unsafe {
+			Self {
+				main: false,
+				stack: Vec::with_capacity(128),
+				domain: ptr::null(),
+				call_recording: HashMap::with_capacity(128),
+				memory_recording: HashMap::with_capacity(64)
+			}
 		}
 	}
 }
@@ -106,6 +97,8 @@ pub fn get_thread_data<'a>() -> &'a mut ThreadData
 		if ptr.is_null()
 		{
 			ptr = Box::leak(Box::default());
+
+			(*ptr).domain = mono_domain_get();
 			
 			let profiler = PROFILER.as_ref().unwrap();
 			
@@ -120,11 +113,13 @@ pub fn get_thread_data<'a>() -> &'a mut ThreadData
 pub struct MonoProfiler
 {
 	pub profiler_recording: bool,
+	pub main_domain: *const MonoDomain,
 	pub args: ProfilerArgs,
 	pub handle: MonoProfilerHandle,
 	pub sync: RwLock<ProfilerSynced>,
 	pub mono_defaults: MonoDefaults,
-	pub threads: Mutex<Vec<&'static mut ThreadData>>
+	pub threads: Mutex<Vec<&'static mut ThreadData>>,
+	pub callbacks: Option<ManagedCallbacks>,
 }
 
 pub struct ProfilerSynced
@@ -136,13 +131,32 @@ pub struct ProfilerSynced
 	pub runtime: Option<RuntimeData>,
 }
 
+pub type BasicIterCallback = extern "system" fn(*mut (), u64, &mut BasicIter, unsafe extern "system" fn(&mut BasicIter, &mut BasicRecord) -> bool);
+pub type AdvancedIterCallback = extern "system" fn(*mut (), u64, &mut AdvIter, unsafe extern "system" fn(&mut AdvIter, &mut AdvancedRecord) -> bool);
+pub type MemoryIterCallback = extern "system" fn(*mut (), u64, &mut MemoryIter, unsafe extern "system" fn(&mut MemoryIter, &mut MemoryRecord) -> bool);
+
+pub type ManagedStringMarshalFunc = extern "system" fn(&mut *const MonoString, *const u8, i32);
+pub type ManagedArrMarshalFunc<T> = extern "system" fn(&mut *const TypedMonoArray<T>, *const T, u64);
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ManagedCallbacks
+{
+	pub string_marshal: ManagedStringMarshalFunc,
+	pub bytes_marshal: ManagedArrMarshalFunc<u8>,
+	
+	pub basic_iter: BasicIterCallback,
+	pub adv_iter: AdvancedIterCallback,
+	pub mem_iter: MemoryIterCallback
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct ProfilerConfig
 {
 	#[serde(rename = "Enabled")]
 	pub enabled: bool,
-	#[serde(rename = "Allocations")]
-	pub allocations: bool,
+	#[serde(rename = "TrackCalls")]
+	pub instrument_methods: bool,
 	#[serde(rename = "SourceViewer")]
 	pub sourceviewer: bool,
 	#[serde(rename = "Assemblies")]
@@ -189,7 +203,8 @@ impl MethodResult
 pub struct MemoryResult
 {
 	pub allocations: u64,
-	pub total_alloc_size: u64
+	pub total_alloc_size: u64,
+	pub instance_size: u32
 }
 
 impl MemoryResult
@@ -216,7 +231,10 @@ pub fn load_config(path: &str) -> anyhow::Result<ProfilerConfig>
 
 pub fn get_default_config(path: &str) -> ProfilerConfig
 {
-	let cfg = ProfilerConfig::default();
+	let cfg = ProfilerConfig {
+		instrument_methods: true,
+		..Default::default()	
+	};
 	let _ = fs::write(path, serde_json::to_string_pretty(&cfg).unwrap().as_bytes());
 	cfg
 }
@@ -236,6 +254,8 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 		if !cfg.enabled {return;}
 		
 		PROFILER = Some(MonoProfiler {
+			main_domain: mono_domain_get(),
+			callbacks: None,
 			profiler_recording: false,
 			args: ProfilerArgs::None,
 			handle: ptr::null(),
@@ -249,24 +269,26 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 			mono_defaults: MonoDefaults::new(),
 			threads: Mutex::new(Vec::new())
 		});
-
+		
 		get_thread_data().main = true;
-
-		let mp = PROFILER.as_mut().unwrap();
+		
+		let mp = PROFILER.as_mut().unwrap_unchecked();
 
 		mp.handle = mono_profiler_create(mp);
 
-		if mp.sync.read().unwrap().config.allocations { 
-			mono_profiler_enable_allocations();
+		let sync = mp.sync.get_mut().unwrap();
+		
+		mono_profiler_enable_allocations();
+		
+		if sync.config.instrument_methods {
+			mono_profiler_set_call_instrumentation_filter_callback(mp.handle, Some(can_profile_method));
+			mono_profiler_set_image_loaded_callback(mp.handle, Some(image_loaded));
 		}
-		mono_profiler_set_call_instrumentation_filter_callback(mp.handle, Some(can_profile_method));
-		mono_profiler_set_image_loaded_callback(mp.handle, Some(image_loaded));
 		#[cfg(debug_assertions)]
 		{
 			mono_profiler_set_method_free_callback(mp.handle, Some(method_free));
 			println!("mono profiler started {:2x}", mp.handle as usize);
 		}
-		
 		
 		return;
 	})
@@ -288,10 +310,11 @@ pub const INST_FLAGS: CallInstrumentationFlags =
 #[no_mangle]
 pub unsafe extern "system" fn register_profiler_assembly(image_raw: *const MonoImage)
 {
-	let profiler = get_profiler!();
-	let mut sync = profiler.sync.write().unwrap();
+	let profiler = some_or_ret!(&mut PROFILER, ());
+	let mut sync = ok_or_ret!(profiler.sync.write(), ());
 	if image_raw.is_null() {return;}
 	let image = &*image_raw;
+	if is_image_blacklisted(image) {return}
 	#[cfg(debug_assertions)]
 	{
 		println!("registering assembly from managed: {}", get_assembly_name(image));
@@ -299,9 +322,29 @@ pub unsafe extern "system" fn register_profiler_assembly(image_raw: *const MonoI
 	sync.profiler_images.insert(image);
 }
 
-pub unsafe extern "C" fn image_loaded(profiler: &mut MonoProfiler, image: &MonoImage)
+pub const IMAGE_BLACKLIST: &[&str] = &["UnityEngine.CoreModule"];
+
+pub unsafe fn is_image_blacklisted(image: &MonoImage) -> bool
 {
-	let mut sync = profiler.sync.write().unwrap();
+	if let Some(name) = read_cstr(image.assembly_name)
+	{
+		IMAGE_BLACKLIST.iter().any(|bl|
+		{
+			(*bl).eq(name)
+		})
+	}
+	else { true }
+}
+
+pub unsafe extern "C" fn image_loaded(profiler: &MonoProfiler, image: &MonoImage)
+{
+	if is_image_blacklisted(image) {return}
+	
+	let td = get_thread_data();
+
+	assert_main_domain!(profiler, td, ());
+
+	let mut sync = ok_or_ret!(profiler.sync.write(), ());
 	
 	let name = read_cstr(image.assembly_name);
 	
@@ -353,7 +396,6 @@ pub struct AdvancedRecord
 {
 	pub assembly_handle: *const MonoImage,
 	pub method_handle: *const MonoMethod,
-	pub method_name: *const MonoString,
 	pub total_time: u64,
 	pub total_time_percentage: f64,
 	pub own_time: u64,
@@ -370,7 +412,6 @@ impl Default for AdvancedRecord
 		{
 			assembly_handle: ptr::null(),
 			method_handle: ptr::null(),
-			method_name: ptr::null_mut(),
 			total_time: 0,
 			total_time_percentage: 0f64,
 			own_time: 0,
@@ -385,10 +426,12 @@ impl Default for AdvancedRecord
 #[repr(C)]
 pub struct MemoryRecord
 {
-	pub klass_handle: *const MonoClass,
-	pub klass_name: *const MonoString,
+	pub assembly_handle: *const MonoImage,
+	pub class_handle: *const MonoClass,
 	pub allocations: u64,
-	pub total_alloc_size: u64
+	pub total_alloc_size: u64,
+	pub instance_size: u32,
+	pub class_token: u32,
 }
 
 impl Default for MemoryRecord
@@ -396,129 +439,212 @@ impl Default for MemoryRecord
 	fn default() -> Self {
 		Self
 		{
-			klass_handle: ptr::null(),
-			klass_name: ptr::null(),
+			assembly_handle: ptr::null(),
+			class_handle: ptr::null(),
+			class_token: 0,
 			allocations: 0,
-			total_alloc_size: 0
+			total_alloc_size: 0,
+			instance_size: 0
 		}
 	}
 }
-
-pub type ManagedStringMarshalFunc = extern "system" fn(&mut *const MonoString, *const u8, i32);
-pub type ManagedArrMarshalFunc<T> = extern "system" fn(&mut *const TypedMonoArray<T>, *const T, u64);
 pub type BasicIter<'a> = (Iter<'a, *const MonoImage, PluginResults>, f64);
-pub type AdvIter<'a> = (Iter<'a, *const MonoMethod, MethodResult>, ManagedStringMarshalFunc, f64);
+pub type AdvIter<'a> = (Iter<'a, *const MonoMethod, MethodResult>, f64);
 pub type MemoryIter<'a> = (Iter<'a, *const MonoClass, MemoryResult>);
 
 #[no_mangle]
-pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, image: *const MonoImage, marshal: ManagedStringMarshalFunc)
+pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, image_ptr: *const MonoImage)
 {
+	let profiler = some_or_ret!(&PROFILER, ());
+	let callbacks = *some_or_ret!(&profiler.callbacks, ());
+	let image = deref_or_ret!(image_ptr, ());
 	if let Some(cs) = read_cstr((*image).assembly_name)
 	{
-		marshal(managed, cs.as_ptr(), cs.len() as i32);
+		(callbacks.string_marshal)(managed, cs.as_ptr(), cs.len() as i32);
 	}
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn get_method_name(managed: &mut *const MonoString, method_ptr: *const MonoMethod)
+{
+	let profiler = some_or_ret!(&PROFILER, ());
+	let callbacks = *some_or_ret!(&profiler.callbacks, ());
+	let method = deref_or_ret!(method_ptr, ());
+	let full_name = get_method_full_name(method, MonoTypeNameFormat::FullName);
+	(callbacks.string_marshal)(managed, full_name.as_ptr(), full_name.len() as i32);
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn get_class_name(managed: &mut *const MonoString, class_ptr: *const MonoClass)
+{
+	let profiler = some_or_ret!(&PROFILER, ());
+	let callbacks = *some_or_ret!(&profiler.callbacks, ());
+	let class = deref_or_ret!(class_ptr, ());
+	let nameptr = mono_type_get_name_full(&class._byval_arg, MonoTypeNameFormat::FullName);
+	let full_name = CStr::from_ptr(nameptr).to_str().unwrap();
+	(callbacks.string_marshal)(managed, full_name.as_ptr(), full_name.len() as i32);
+	mono_free_g(nameptr);
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn profiler_register_callbacks(callbacks: &ManagedCallbacks)
+{
+	let mut profiler = some_or_ret!(&mut PROFILER, ());
+	profiler.callbacks = Some(*callbacks);
 }
 
 bitflags! {
 	#[repr(C)]
-	#[derive(PartialEq)]
-	pub struct ProfilerArgs: u8
+	#[derive(PartialEq, Copy, Clone)]
+	pub struct ProfilerArgs: u16
 	{
 		const None = 0;
 		const Abort = 1 << 0;
-		const Advanced = 1 << 1;
-		const Memory = 1 << 2;
-		const AdvancedMemory = 1 << 3; // TODO: add advanced memory profiling
-		const Timings = 1 << 4;
+		const CallMemory = 1 << 1;
+		const AdvancedMemory = 1 << 2;
+		const Timings = 1 << 3;
+		const Stack = 1 << 4;
+		const FastResume = 1 << 5;
+		//const ExportProto = 1 << 5;  // TODO: add exports
+		//const ExportJson = 1 << 6;
 	}
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn profiler_toggle(
-	args: ProfilerArgs,
+	mut args: ProfilerArgs,
 	state: &mut bool,
 	basic_out: *mut (),
 	adv_out: *mut (),
-	marshal_string: ManagedStringMarshalFunc,
-	basic_iter_cb: extern "system" fn(*mut (), u64, &mut BasicIter, unsafe extern "system" fn(&mut BasicIter, &mut BasicRecord) -> bool),
-	advanced_iter_cb: extern "system" fn(*mut (), u64, &mut AdvIter, unsafe extern "system" fn(&mut AdvIter, &mut AdvancedRecord) -> bool),
-	//memory_iter_cb: extern "system" fn(*mut (), u64, &mut MemoryIter, unsafe extern "system" fn(&mut MemoryIter, &mut MemoryResult) -> bool),
+	mem_out: *mut ()
 ) -> ProfilerResultCode
 {
 	return run_ffi_safe!("profiler_toggle", ProfilerResultCode::UnknownError, {
 		let td = get_thread_data();
 		if !td.main {return ProfilerResultCode::MainThreadOnly;}
-		let profiler = get_profiler!(ProfilerResultCode::NotInitialized);
-		let mut others = profiler.threads.lock().unwrap();
-		let mut sync = profiler.sync.write().unwrap();
+		let profiler = some_or_ret!(&mut PROFILER, ProfilerResultCode::NotInitialized);
+		let mut others = ok_or_ret!(profiler.threads.lock(), ProfilerResultCode::CorruptedState);
+		let mut sync = ok_or_ret!(profiler.sync.write(), ProfilerResultCode::CorruptedState);
+		let callbacks = *some_or_ret!(&profiler.callbacks, ProfilerResultCode::NotInitialized);
 		match !profiler.profiler_recording {
 			true => {
 				if args.contains(ProfilerArgs::Abort)
 				{
 					return ProfilerResultCode::Aborted;
 				}
+				
+				if profiler.args & ProfilerArgs::FastResume != args & ProfilerArgs::FastResume
+				{
+					if profiler.args.contains(ProfilerArgs::FastResume) {
+						for thread in others.iter_mut()
+						{
+							thread.stack.clear();
+						}
+					}
+					else
+					{
+						args.remove(ProfilerArgs::FastResume);
+					}
+				}
+				
+				if !args.contains(ProfilerArgs::FastResume) {
+					let mut any = false;
+					
+					if sync.config.instrument_methods && args.contains(ProfilerArgs::Stack)
+					{
+						any = true;
+						mono_profiler_set_method_enter_callback(profiler.handle, Some(enter_method));
+						mono_profiler_set_method_leave_callback(profiler.handle, Some(exit_method));
+						mono_profiler_set_method_exception_leave_callback(profiler.handle, Some(method_exception));
+					}
+					else
+					{
+						args.remove(ProfilerArgs::CallMemory);
+					}
+					
+					if args & (ProfilerArgs::AdvancedMemory | ProfilerArgs::CallMemory) != ProfilerArgs::None {
+						any = true;
+						mono_profiler_set_gc_allocation_callback(profiler.handle, Some(gc_alloc_cb));
+					}
+					
+					if !any
+					{
+						*state = false;
+						return ProfilerResultCode::InvalidArgs;
+					}
+					
+					profiler.args = args;
+				}
+				
 				sync.runtime = Some(RuntimeData
 				{
 					started: Instant::now()
 				});
-				*state = true;
-				if sync.config.allocations {
-					mono_profiler_set_gc_allocation_callback(profiler.handle, Some(gc_alloc_cb));
-				}
-				mono_profiler_set_method_enter_callback(profiler.handle, Some(enter_method));
-				mono_profiler_set_method_leave_callback(profiler.handle, Some(exit_method));
-				mono_profiler_set_method_exception_leave_callback(profiler.handle, Some(method_exception));
-				profiler.args = args;
+				
 				profiler.profiler_recording = true;
+				*state = true;
 				drop(sync);
+				drop(others);
 			}
 			false => {
 				profiler.profiler_recording = false;
-				profiler.args = ProfilerArgs::None;
-				mono_profiler_set_method_enter_callback(profiler.handle, None);
-				mono_profiler_set_method_leave_callback(profiler.handle, None);
-				mono_profiler_set_method_exception_leave_callback(profiler.handle, None);
-				if sync.config.allocations {
+				if args.contains(ProfilerArgs::FastResume) && !args.contains(ProfilerArgs::Abort) {
+					profiler.args = args;
+				}
+				else
+				{
+					profiler.args = ProfilerArgs::None;
+					mono_profiler_set_method_enter_callback(profiler.handle, None);
+					mono_profiler_set_method_leave_callback(profiler.handle, None);
+					mono_profiler_set_method_exception_leave_callback(profiler.handle, None);
 					mono_profiler_set_gc_allocation_callback(profiler.handle, None);
 				}
 				//println!("Profile complete");
 				let now = Instant::now();
 				// TODO: do this the right way
-				thread::sleep(Duration::from_millis(50));
+				thread::sleep(Duration::from_millis(25));
 
 				let rt = mem::take(&mut sync.runtime).unwrap();
-
-				let mut data = mem::take(&mut td.call_recording);
 				
 				if args.contains(ProfilerArgs::Abort)
 				{
 					for thread in others.iter_mut() {
 						thread.call_recording.clear();
+						thread.memory_recording.clear();
 						thread.stack.clear();
 					}
-					data.clear();
-					td.call_recording = data;
 					return ProfilerResultCode::Aborted;
 				}
-
+				
+				let mut call_data = mem::take(&mut td.call_recording);
+				
+				let mut mem_data = mem::take(&mut td.memory_recording);
+				
 				for thread in others.iter_mut() {
-					thread.stack.clear();
+					if !args.contains(ProfilerArgs::FastResume) {
+						thread.stack.clear();
+					}
 					if ptr::eq(*thread, td) {continue;}
 					for (method, result) in &mut thread.call_recording {
-						match data.entry(*method) {
+						match call_data.entry(*method) {
 							Entry::Occupied(mut x) => x.get_mut().merge_from(result),
 							Entry::Vacant(x) => {x.insert(*result);}
 						}
 					}
+					for (klass, result) in &mut thread.memory_recording {
+						match mem_data.entry(*klass) {
+							Entry::Occupied(mut current) => current.get_mut().merge_from(result),
+							Entry::Vacant(x) => {x.insert(*result);}
+						}
+					}
 					thread.call_recording.clear();
+					thread.memory_recording.clear();
 				}
-
-				let mut basic_ret: BasicIter;
 
 				let total_time = now.duration_since(rt.started).as_millis() as f64;
 				
 				let mut plugin_data: HashMap<*const MonoImage, PluginResults> = HashMap::with_capacity(sync.profiler_images.len());
-				for (method, method_results) in data.iter_mut() {
+				for (method, method_results) in call_data.iter_mut() {
 					let entry = plugin_data.entry((*(**method).class).image).or_insert_with(||{
 						PluginResults {
 							calls: 0,
@@ -530,24 +656,38 @@ pub unsafe extern "system" fn profiler_toggle(
 					entry.allocations += method_results.own_allocations;
 					entry.total_time += method_results.own_time;
 				}
-				basic_ret = (plugin_data.iter(), total_time);
+				let mut basic_ret: BasicIter = (plugin_data.iter(), total_time);
 
 				*state = false;
-
+				
+				// managed methods cannot be called while holding the profiler lock
+				
 				drop(sync);
+				drop(others);
 				
-				basic_iter_cb(basic_out, plugin_data.len() as u64, &mut basic_ret, iter_basic_fn);
-				
-				if args.contains(ProfilerArgs::Advanced)
+				if !plugin_data.is_empty()
 				{
-					data.retain(|_k,v|{
-						v.total_time.as_millis() > 0 || v.total_allocations > 0
-					});
-					advanced_iter_cb(adv_out, data.len() as u64, &mut (data.iter(), marshal_string, total_time), iter_advanced_fn);
+					(callbacks.basic_iter)(basic_out, plugin_data.len() as u64, &mut basic_ret, iter_basic_fn);
 				}
 				
-				data.clear();
-				td.call_recording = data;
+				call_data.retain(|_k,v|{
+					v.total_time.as_micros() > 0 || v.total_allocations > 0
+				});
+				
+				if !call_data.is_empty()
+				{
+					(callbacks.adv_iter)(adv_out, call_data.len() as u64, &mut (call_data.iter(), total_time), iter_advanced_fn);
+				}
+				
+				if !mem_data.is_empty()
+				{
+					(callbacks.mem_iter)(mem_out, mem_data.len() as u64, &mut (mem_data.iter()), iter_memory_fn);
+				}
+				
+				call_data.clear();
+				td.call_recording = call_data;
+				mem_data.clear();
+				td.memory_recording = mem_data;
 			}
 		}
 
@@ -563,7 +703,7 @@ pub unsafe extern "system" fn profiler_toggle(
 			*out = BasicRecord
 			{
 				assembly_handle: *image,
-				total_time: result.total_time.as_millis() as u64,
+				total_time: result.total_time.as_micros() as u64,
 				total_time_percentage: (result.total_time.as_millis() as f64 / *total_time) * 100f64,
 				calls: result.calls,
 				alloc: result.allocations
@@ -573,27 +713,46 @@ pub unsafe extern "system" fn profiler_toggle(
 		false
 	}
 	unsafe extern "system" fn iter_advanced_fn(
-		(iter, marshal_string, total_time): &mut AdvIter,
+		(iter, total_time): &mut AdvIter,
 		out: &mut AdvancedRecord
 	) -> bool
 	{
 		if let Some((method, result)) = iter.next()
 		{
-			let fullname = get_method_full_name(&**method, MonoTypeNameFormat::FullName);
 			*out = AdvancedRecord
 			{
 				assembly_handle: (*(*(*method)).class).image,
 				method_handle: *method,
-				total_time: result.total_time.as_millis() as u64,
+				total_time: result.total_time.as_micros() as u64,
 				total_time_percentage: (result.total_time.as_millis() as f64 / *total_time) * 100f64,
-				own_time: result.own_time.as_millis() as u64,
+				own_time: result.own_time.as_micros() as u64,
 				own_time_percentage: (result.own_time.as_millis() as f64 / *total_time) * 100f64,
 				calls: result.calls,
 				total_alloc: result.total_allocations,
-				own_alloc: result.own_allocations, 
-				..Default::default()
+				own_alloc: result.own_allocations
 			};
-			marshal_string(&mut out.method_name, fullname.as_ptr(), fullname.len() as i32);
+			return true;
+		}
+		false
+	}
+
+	unsafe extern "system" fn iter_memory_fn(
+		(iter): &mut MemoryIter,
+		out: &mut MemoryRecord
+	) -> bool
+	{
+		if let Some((class_ptr, result)) = iter.next()
+		{
+			let class = &**class_ptr;
+			*out = MemoryRecord
+			{
+				assembly_handle: class.image,
+				class_token: class.type_token,
+				class_handle: *class_ptr,
+				allocations: result.allocations,
+				total_alloc_size: result.total_alloc_size,
+				instance_size: class.instance_size as u32
+			};
 			return true;
 		}
 		false
@@ -618,15 +777,17 @@ pub unsafe fn debug_log_method(method: &MonoMethod)
 }
 
 #[cfg(debug_assertions)]
-pub unsafe extern "C" fn method_free(_profiler: &mut MonoProfiler, method: &MonoMethod)
+pub unsafe extern "C" fn method_free(_profiler: &MonoProfiler, method: &MonoMethod)
 {
 	debug_log_method(method);
 	println!("method free");
 }
 
-pub unsafe extern "C" fn can_profile_method(profiler: &mut MonoProfiler, mut method: &MonoMethod) -> CallInstrumentationFlags
+pub unsafe extern "C" fn can_profile_method(profiler: &MonoProfiler, mut method: &MonoMethod) -> CallInstrumentationFlags
 {
-	let sync = profiler.sync.read().unwrap();
+	let td = get_thread_data();
+	assert_main_domain!(profiler, td, CallInstrumentationFlags::None);
+	let sync = ok_or_ret!(profiler.sync.read(), CallInstrumentationFlags::None);
 	match sync.profiler_method_detour_map.get(&(method as *const MonoMethod))
 	{
 		None => {}
@@ -669,38 +830,51 @@ pub unsafe fn get_sizeof_object(profiler: &MonoProfiler, object: &MonoObject) ->
 	}
 }
 
-pub unsafe extern "C" fn gc_alloc_cb(profiler: &mut MonoProfiler, obj_ptr: *const MonoObject)
+pub unsafe extern "C" fn gc_alloc_cb(profiler: &MonoProfiler, obj_ptr: *const MonoObject)
 {
-	if !profiler.profiler_recording || !profiler.args.contains(ProfilerArgs::Memory) || obj_ptr.is_null() {return;}
+	if !profiler.profiler_recording || obj_ptr.is_null() {return;}
 	let td = get_thread_data();
+	assert_main_domain!(profiler, td, ());
 	let object= &*obj_ptr;
-	let frame: &mut StackFrame = match td.stack.last_mut() {
-		None => return,
-		Some(x) => x
-	};
 	let alloc = get_sizeof_object(profiler, object) as u64;
-	frame.own_allocations += alloc;
-	frame.total_allocations += alloc;
-	
-	//if profiler.args.contains(ProfilerArgs::AdvancedMemory)
-	{
-		// TODO: advanced memory
+	if profiler.args.contains(ProfilerArgs::CallMemory) {
+		if let Some(frame) = td.stack.last_mut()
+		{
+			frame.own_allocations += alloc;
+			frame.total_allocations += alloc;
+		};
+	}
+	if profiler.args.contains(ProfilerArgs::AdvancedMemory) {
+		let klass = (*object.vtable).klass;
+		if klass.is_null() {return;}
+		let entry = td.memory_recording.entry(klass).or_insert_with(||{
+			MemoryResult
+			{
+				instance_size: (*klass).instance_size as u32,
+				..Default::default()
+			}
+		});
+		entry.allocations += 1;
+		entry.total_alloc_size += alloc;
 	}
 }
 
 #[inline]
-pub unsafe extern "C" fn enter_method(profiler: &mut MonoProfiler, method: &MonoMethod, _ctx: *const MonoProfilerCallContext)
+pub unsafe extern "C" fn enter_method(profiler: &MonoProfiler, method: &MonoMethod, _ctx: *const MonoProfilerCallContext)
 {
 	if !profiler.profiler_recording { return; }
 	let td = get_thread_data();
+	assert_main_domain!(profiler, td, ());
 	td.stack.push(StackFrame::new(method, td.main && profiler.args.contains(ProfilerArgs::Timings)));
 }
 
-pub unsafe extern "C" fn exit_method(profiler: &mut MonoProfiler, method_ptr: *const MonoMethod, _ctx: *const MonoProfilerCallContext)
+pub unsafe extern "C" fn exit_method(profiler: &MonoProfiler, method_ptr: *const MonoMethod, _ctx: *const MonoProfilerCallContext)
 {
 	if !profiler.profiler_recording { return; }
 
 	let td = get_thread_data();
+
+	assert_main_domain!(profiler, td, ());
 
 	let idx: usize;
 	let frame: &StackFrame = match td.stack.iter().rposition(|sf| {
@@ -750,8 +924,7 @@ pub unsafe extern "C" fn exit_method(profiler: &mut MonoProfiler, method_ptr: *c
 	td.stack.truncate(idx);
 }
 
-
-pub unsafe extern "C" fn method_exception(profiler: &mut MonoProfiler, method: *const MonoMethod, _exception: *const MonoObject)
+pub unsafe extern "C" fn method_exception(profiler: &MonoProfiler, method: *const MonoMethod, _exception: *const MonoObject)
 {
 	exit_method(profiler, method, ptr::null());
 }

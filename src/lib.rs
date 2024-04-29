@@ -7,7 +7,7 @@ use std::ffi::{c_char, CStr};
 mod profiler;
 mod mono;
 
-pub const PROTOCOL: u64 = 1;
+pub const PROTOCOL: u64 = 2;
 
 #[no_mangle]
 pub unsafe extern "system" fn carbon_get_protocol() -> u64
@@ -38,6 +38,42 @@ pub unsafe extern "system" fn log_message(level: Severity, verb: i32, ptr: *cons
 		None => (),
 		Some(x) => x(level, verb, ptr, len, source)
 	}
+}
+#[macro_export]
+macro_rules! ok_or_ret {
+	($expr:expr, $default:expr) => {
+		match $expr {
+			Err(_) => {return $default;},
+			Ok(x) => x
+		}
+	};
+}
+#[macro_export]
+macro_rules! assert_main_domain {
+	($profiler:expr, $td:expr, $default:expr) => {
+		match $profiler.main_domain == $td.domain {
+			false => {return $default;},
+			true => {}
+		}
+	};
+}
+#[macro_export]
+macro_rules! some_or_ret {
+	($expr:expr, $default:expr) => {
+		match $expr {
+			None => {return $default;},
+			Some(x) => x
+		}
+	};
+}
+#[macro_export]
+macro_rules! deref_or_ret {
+	($expr:expr, $default:expr) => {
+		match $expr.is_null() {
+			false => &*$expr,
+			true => {return $default;}
+		}
+	};
 }
 
 pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str>

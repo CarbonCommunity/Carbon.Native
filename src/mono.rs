@@ -12,15 +12,17 @@ extern "C" {
 	fn mono_free(ptr: *mut ());
 	pub fn mono_type_get_name_full(mtype: *const MonoType, format: MonoTypeNameFormat) -> *mut c_char;
 	pub fn mono_get_string_class() -> *const MonoClass;
+	pub fn mono_string_new_len(domain: *const MonoDomain, utf8: *const u8, len: u32) -> *const MonoString;
+	pub fn mono_domain_get() -> *const MonoDomain;
 	pub fn mono_profiler_enable_allocations() -> bool;
-	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoObject)>);
-	pub fn mono_profiler_set_image_loaded_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoImage)>);
-	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoMethod, *const MonoProfilerCallContext)>);
-	pub fn mono_profiler_set_method_tail_call_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoMethod)>);
-	pub fn mono_profiler_set_method_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext)>);
-	pub fn mono_profiler_set_method_exception_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, *const MonoMethod, *const MonoObject)>);
-	pub fn mono_profiler_set_method_free_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoMethod)>);
-	pub fn mono_profiler_set_call_instrumentation_filter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&mut MonoProfiler, &MonoMethod) -> CallInstrumentationFlags>);
+	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoObject)>);
+	pub fn mono_profiler_set_image_loaded_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoImage)>);
+	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod, *const MonoProfilerCallContext)>);
+	pub fn mono_profiler_set_method_tail_call_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoMethod)>);
+	pub fn mono_profiler_set_method_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext)>);
+	pub fn mono_profiler_set_method_exception_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoObject)>);
+	pub fn mono_profiler_set_method_free_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod)>);
+	pub fn mono_profiler_set_call_instrumentation_filter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod) -> CallInstrumentationFlags>);
 	pub fn mono_profiler_create(info: *mut MonoProfiler) -> MonoProfilerHandle;
 }
 
@@ -340,6 +342,12 @@ pub struct MonoString
 
 impl MonoString
 {
+	pub fn from_str(string: &str) -> *const Self
+	{
+		unsafe {
+			mono_string_new_len(mono_domain_get(), string.as_ptr(), string.len() as u32)
+		}
+	}
 	pub fn get_string(&self) -> String
 	{
 		if self.length < 1
@@ -424,8 +432,8 @@ pub struct MonoVTable
 	* the vtable.
 	*/
 	gc_descr: *const (),
-	domain: *const MonoDomain,  /* each object/vtable belongs to exactly one domain */
-	mtype: *const (), /* System.Type type for klass */
+	pub domain: *const MonoDomain,  /* each object/vtable belongs to exactly one domain */
+	pub mtype: *const (), /* System.Type type for klass */
 	interface_bitmap: *const guint8,
 	max_interface_id: guint32,
 	rank: guint8,
