@@ -1,3 +1,11 @@
+/*
+ *
+ * Copyright (c) 2024 Carbon Community
+ * Copyright (c) 2024 Patrette
+ * All rights reserved.
+ *
+ */
+
 use std::{fs, mem, ptr, slice, thread};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};

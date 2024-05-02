@@ -1,3 +1,11 @@
+/*
+ *
+ * Copyright (c) 2024 Carbon Community
+ * Copyright (c) 2024 Patrette
+ * All rights reserved.
+ *
+ */
+
 use std::ffi::{c_char, CStr};
 
 //mod compiler;
