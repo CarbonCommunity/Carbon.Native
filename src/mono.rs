@@ -14,17 +14,25 @@ extern "C" {
 	pub fn mono_get_string_class() -> *const MonoClass;
 	pub fn mono_string_new_len(domain: *const MonoDomain, utf8: *const u8, len: u32) -> *const MonoString;
 	pub fn mono_domain_get() -> *const MonoDomain;
+	pub fn mono_gc_is_incremental() -> bool;
 	pub fn mono_profiler_enable_allocations() -> bool;
-	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoObject)>);
+	pub fn mono_profiler_set_exception_throw_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoObject)>);
+	pub fn mono_profiler_set_gc_event_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, MonoProfilerGCEvent, u32, bool)>);
+	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<GCAllocCB>);
 	pub fn mono_profiler_set_image_loaded_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoImage)>);
-	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod, *const MonoProfilerCallContext)>);
+	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<EnterCB>);
 	pub fn mono_profiler_set_method_tail_call_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoMethod)>);
-	pub fn mono_profiler_set_method_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext)>);
-	pub fn mono_profiler_set_method_exception_leave_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoObject)>);
+	pub fn mono_profiler_set_method_leave_callback(handle: MonoProfilerHandle, cb: Option<ExitCB>);
+	pub fn mono_profiler_set_method_exception_leave_callback(handle: MonoProfilerHandle, cb: Option<ExceptionalExitCB>);
 	pub fn mono_profiler_set_method_free_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod)>);
 	pub fn mono_profiler_set_call_instrumentation_filter_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoMethod) -> CallInstrumentationFlags>);
 	pub fn mono_profiler_create(info: *mut MonoProfiler) -> MonoProfilerHandle;
 }
+
+pub type EnterCB = unsafe extern "C" fn(&MonoProfiler, &MonoMethod, *const MonoProfilerCallContext);
+pub type ExitCB = unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext);
+pub type ExceptionalExitCB = unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoObject);
+pub type GCAllocCB = unsafe extern "C" fn(&MonoProfiler, &MonoObject);
 
 pub unsafe fn mono_free_g<T>(ptr: *mut T)
 {
@@ -410,6 +418,25 @@ impl<T> TypedMonoArray<T>
 			return None;
 		}
 	}
+}
+#[derive(Debug)]
+#[repr(C)]
+pub enum MonoProfilerGCEvent
+{
+	PreStopWorld = 6,
+	/**
+	 * When this event arrives, the GC and suspend locks are acquired.
+	 */
+	PreStopWorldLocked = 10,
+	PostStopWorld = 7,
+	START = 0,
+	END = 5,
+	PreStartWorld = 8,
+	/**
+	 * When this event arrives, the GC and suspend locks are released.
+	 */
+	PostStartWorldUnlocked = 11,
+	PostStartWorld = 9,
 }
 
 pub type MonoProfilerHandle = *const ();

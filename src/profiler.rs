@@ -34,7 +34,7 @@ pub struct StackFrame
 	pub method: *const MonoMethod,
 	pub own_allocations: u64,
 	pub total_allocations: u64,
-	pub time: Option<StackTiming>,
+	pub time: Option<StackTiming>
 }
 
 pub struct StackTiming
@@ -45,23 +45,14 @@ pub struct StackTiming
 
 impl StackFrame
 {
-	pub fn new(method: *const MonoMethod, timing: bool) -> Self
+	#[inline]
+	pub fn new(method: *const MonoMethod, timing: Option<StackTiming>) -> Self
 	{
 		StackFrame
 		{
 			own_allocations: 0,
 			total_allocations: 0,
-			time: if timing
-			{
-				Some(StackTiming
-				{
-					time: Instant::now(),
-					others: Duration::ZERO
-				})
-			}
-			else {
-				None
-			},
+			time: timing,
 			method
 		}
 	}
@@ -73,7 +64,10 @@ pub struct ThreadData
 	pub stack: Vec<StackFrame>,
 	pub domain: *const MonoDomain,
 	pub call_recording: HashMap<*const MonoMethod, MethodResult>,
-	pub memory_recording: HashMap<*const MonoClass, MemoryResult>
+	pub memory_recording: HashMap<*const MonoClass, MemoryResult>,
+	pub gc_clock: Option<Instant>,
+	// Only used from the main thread
+	pub gc_timings: GCTimings
 }
 
 impl Default for ThreadData {
@@ -84,7 +78,9 @@ impl Default for ThreadData {
 				stack: Vec::with_capacity(128),
 				domain: ptr::null(),
 				call_recording: HashMap::with_capacity(128),
-				memory_recording: HashMap::with_capacity(64)
+				memory_recording: HashMap::with_capacity(64),
+				gc_clock: None,
+				gc_timings: Default::default()
 			}
 		}
 	}
@@ -182,6 +178,8 @@ pub struct MethodResult
 	pub calls: u64,
 	pub total_allocations: u64,
 	pub own_allocations: u64,
+	pub total_exceptions: u64,
+	pub own_exceptions: u64,
 	pub total_time: Duration,
 	pub own_time: Duration
 }
@@ -196,6 +194,8 @@ impl MethodResult
 		self.calls += input.calls;
 		self.total_allocations += input.total_allocations;
 		self.own_allocations += input.own_allocations;
+		self.total_exceptions += input.total_exceptions;
+		self.own_exceptions += input.own_exceptions;
 	}
 }
 
@@ -216,12 +216,13 @@ impl MemoryResult
 		self.total_alloc_size += input.total_alloc_size;
 	}
 }
-
+#[derive(Default)]
 pub struct PluginResults
 {
 	pub calls: u64,
 	pub allocations: u64,
 	pub total_time: Duration,
+	pub exceptions: u64
 }
 
 pub fn load_config(path: &str) -> anyhow::Result<ProfilerConfig>
@@ -270,6 +271,11 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 			threads: Mutex::new(Vec::new())
 		});
 		
+		#[cfg(debug_assertions)]
+		{
+			println!("gc incremental: {}", mono_gc_is_incremental());
+		}
+		
 		get_thread_data().main = true;
 		
 		let mp = PROFILER.as_mut().unwrap_unchecked();
@@ -310,7 +316,7 @@ pub const INST_FLAGS: CallInstrumentationFlags =
 #[no_mangle]
 pub unsafe extern "system" fn register_profiler_assembly(image_raw: *const MonoImage)
 {
-	let profiler = some_or_ret!(&mut PROFILER, ());
+	let profiler = some_or_ret!(&PROFILER, ());
 	let mut sync = ok_or_ret!(profiler.sync.write(), ());
 	if image_raw.is_null() {return;}
 	let image = &*image_raw;
@@ -367,12 +373,21 @@ pub unsafe fn get_assembly_name(profiler: &MonoImage) -> String
 	})
 }
 
+#[derive(Default)]
+#[repr(C)]
+pub struct GCRecord
+{
+	pub calls: u64,
+	pub total_time: u64,
+}
+
 #[repr(C)]
 pub struct BasicRecord
 {
 	pub assembly_handle: *const MonoImage,
 	pub total_time: u64,
 	pub total_time_percentage: f64,
+	pub total_exceptions: u64,
 	pub calls: u64,
 	pub alloc: u64,
 }
@@ -385,6 +400,7 @@ impl Default for BasicRecord
 			assembly_handle: ptr::null(),
 			total_time: 0,
 			total_time_percentage: 0f64,
+			total_exceptions: 0,
 			calls: 0,
 			alloc: 0
 		}
@@ -403,6 +419,8 @@ pub struct AdvancedRecord
 	pub calls: u64,
 	pub total_alloc: u64,
 	pub own_alloc: u64,
+	pub total_exceptions: u64,
+	pub own_exceptions: u64,
 }
 
 impl Default for AdvancedRecord
@@ -418,7 +436,9 @@ impl Default for AdvancedRecord
 			own_time_percentage: 0f64,
 			calls: 0,
 			total_alloc: 0,
-			own_alloc: 0
+			own_alloc: 0,
+			total_exceptions : 0,
+			own_exceptions: 0
 		}
 	}
 }
@@ -489,7 +509,7 @@ pub unsafe extern "system" fn get_class_name(managed: &mut *const MonoString, cl
 #[no_mangle]
 pub unsafe extern "system" fn profiler_register_callbacks(callbacks: &ManagedCallbacks)
 {
-	let mut profiler = some_or_ret!(&mut PROFILER, ());
+	let profiler = some_or_ret!(&mut PROFILER, ());
 	profiler.callbacks = Some(*callbacks);
 }
 
@@ -505,6 +525,7 @@ bitflags! {
 		const Timings = 1 << 3;
 		const Stack = 1 << 4;
 		const FastResume = 1 << 5;
+		const GCEvent = 1 << 6;
 		//const ExportProto = 1 << 5;  // TODO: add exports
 		//const ExportJson = 1 << 6;
 	}
@@ -514,6 +535,7 @@ bitflags! {
 pub unsafe extern "system" fn profiler_toggle(
 	mut args: ProfilerArgs,
 	state: &mut bool,
+	gc_out: *mut GCRecord,
 	basic_out: *mut (),
 	adv_out: *mut (),
 	mem_out: *mut ()
@@ -550,21 +572,62 @@ pub unsafe extern "system" fn profiler_toggle(
 				if !args.contains(ProfilerArgs::FastResume) {
 					let mut any = false;
 					
-					if sync.config.instrument_methods && args.contains(ProfilerArgs::Stack)
+					let stack = sync.config.instrument_methods && args.contains(ProfilerArgs::Stack);
+					
+					let call_memory = stack && args.contains(ProfilerArgs::CallMemory);
+					
+					if stack
 					{
 						any = true;
-						mono_profiler_set_method_enter_callback(profiler.handle, Some(enter_method));
-						mono_profiler_set_method_leave_callback(profiler.handle, Some(exit_method));
-						mono_profiler_set_method_exception_leave_callback(profiler.handle, Some(method_exception));
+						let enter: EnterCB;
+						let exit: ExitCB;
+						let exception: ExceptionalExitCB;
+						if args.contains(ProfilerArgs::Timings) {
+							enter = method_enter::<true>;
+							exit = method_leave::<true>;
+							exception = method_exception_leave::<true>;
+						}
+						else
+						{
+							enter = method_enter::<false>;
+							exit = method_leave::<false>;
+							exception = method_exception_leave::<false>;
+						}
+						mono_profiler_set_method_enter_callback(profiler.handle, Some(enter));
+						mono_profiler_set_method_leave_callback(profiler.handle, Some(exit));
+						mono_profiler_set_method_exception_leave_callback(profiler.handle, Some(exception));
+						mono_profiler_set_exception_throw_callback(profiler.handle, Some(exception_thrown));
 					}
 					else
 					{
 						args.remove(ProfilerArgs::CallMemory);
 					}
 					
-					if args & (ProfilerArgs::AdvancedMemory | ProfilerArgs::CallMemory) != ProfilerArgs::None {
+					if call_memory || args.contains(ProfilerArgs::AdvancedMemory) {
 						any = true;
-						mono_profiler_set_gc_allocation_callback(profiler.handle, Some(gc_alloc_cb));
+						
+						let alloc_cb: GCAllocCB;
+						
+						if call_memory && args.contains(ProfilerArgs::AdvancedMemory)
+						{
+							alloc_cb = gc_alloc_cb::<true, true>;
+						}
+						else if call_memory
+						{
+							alloc_cb = gc_alloc_cb::<true, false>;
+						}
+						else // Only advanced memory
+						{
+							alloc_cb = gc_alloc_cb::<false, true>;
+						}
+						
+						mono_profiler_set_gc_allocation_callback(profiler.handle, Some(alloc_cb));
+					}
+					
+					if args.contains(ProfilerArgs::GCEvent)
+					{
+						any = true;
+						mono_profiler_set_gc_event_callback(profiler.handle, Some(gc_collect_cb));
 					}
 					
 					if !any
@@ -598,6 +661,8 @@ pub unsafe extern "system" fn profiler_toggle(
 					mono_profiler_set_method_leave_callback(profiler.handle, None);
 					mono_profiler_set_method_exception_leave_callback(profiler.handle, None);
 					mono_profiler_set_gc_allocation_callback(profiler.handle, None);
+					mono_profiler_set_gc_event_callback(profiler.handle, None);
+					mono_profiler_set_exception_throw_callback(profiler.handle, None);
 				}
 				//println!("Profile complete");
 				let now = Instant::now();
@@ -612,6 +677,7 @@ pub unsafe extern "system" fn profiler_toggle(
 						thread.call_recording.clear();
 						thread.memory_recording.clear();
 						thread.stack.clear();
+						thread.gc_timings = GCTimings::default();
 					}
 					return ProfilerResultCode::Aborted;
 				}
@@ -619,6 +685,16 @@ pub unsafe extern "system" fn profiler_toggle(
 				let mut call_data = mem::take(&mut td.call_recording);
 				
 				let mut mem_data = mem::take(&mut td.memory_recording);
+				
+				if args.contains(ProfilerArgs::GCEvent) && !gc_out.is_null()
+				{
+					let gct = mem::take(&mut td.gc_timings);
+					*gc_out = GCRecord
+					{
+						calls: gct.calls,
+						total_time: gct.total_time.as_micros() as u64
+					}
+				}
 				
 				for thread in others.iter_mut() {
 					if !args.contains(ProfilerArgs::FastResume) {
@@ -645,16 +721,11 @@ pub unsafe extern "system" fn profiler_toggle(
 				
 				let mut plugin_data: HashMap<*const MonoImage, PluginResults> = HashMap::with_capacity(sync.profiler_images.len());
 				for (method, method_results) in call_data.iter_mut() {
-					let entry = plugin_data.entry((*(**method).class).image).or_insert_with(||{
-						PluginResults {
-							calls: 0,
-							allocations: 0,
-							total_time: Duration::ZERO
-						}
-					});
+					let entry = plugin_data.entry((*(**method).class).image).or_default();
 					entry.calls += method_results.calls;
 					entry.allocations += method_results.own_allocations;
 					entry.total_time += method_results.own_time;
+					entry.exceptions += method_results.own_exceptions;
 				}
 				let mut basic_ret: BasicIter = (plugin_data.iter(), total_time);
 
@@ -669,10 +740,6 @@ pub unsafe extern "system" fn profiler_toggle(
 				{
 					(callbacks.basic_iter)(basic_out, plugin_data.len() as u64, &mut basic_ret, iter_basic_fn);
 				}
-				
-				call_data.retain(|_k,v|{
-					v.total_time.as_micros() > 0 || v.total_allocations > 0
-				});
 				
 				if !call_data.is_empty()
 				{
@@ -706,7 +773,8 @@ pub unsafe extern "system" fn profiler_toggle(
 				total_time: result.total_time.as_micros() as u64,
 				total_time_percentage: (result.total_time.as_millis() as f64 / *total_time) * 100f64,
 				calls: result.calls,
-				alloc: result.allocations
+				alloc: result.allocations,
+				total_exceptions: result.exceptions
 			};
 			return true;
 		}
@@ -729,7 +797,9 @@ pub unsafe extern "system" fn profiler_toggle(
 				own_time_percentage: (result.own_time.as_millis() as f64 / *total_time) * 100f64,
 				calls: result.calls,
 				total_alloc: result.total_allocations,
-				own_alloc: result.own_allocations
+				own_alloc: result.own_allocations,
+				total_exceptions: result.total_exceptions,
+				own_exceptions: result.own_exceptions
 			};
 			return true;
 		}
@@ -829,22 +899,59 @@ pub unsafe fn get_sizeof_object(profiler: &MonoProfiler, object: &MonoObject) ->
 		_ => {0}
 	}
 }
-
-pub unsafe extern "C" fn gc_alloc_cb(profiler: &MonoProfiler, obj_ptr: *const MonoObject)
+#[derive(Default)]
+pub struct GCTimings
 {
-	if !profiler.profiler_recording || obj_ptr.is_null() {return;}
+	pub total_time: Duration,
+	pub calls: u64
+}
+
+pub unsafe extern "C" fn gc_collect_cb(profiler: &MonoProfiler, event: MonoProfilerGCEvent, /* always 0 - true in boehm */ _generation: u32, _serial: bool)
+{
+	if !profiler.profiler_recording {return;}
+	let td = get_thread_data();
+	
+	if !td.main {return;}
+
+	// https://github.com/Unity-Technologies/mono/blob/1c8577ecab30c96474982a3bcfaf4ab2d84fef7a/mono/metadata/boehm-gc.c#L556
+	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
+	match event {
+		// GC start
+		MonoProfilerGCEvent::PreStopWorld => {
+			td.gc_clock = Some(Instant::now());
+		},
+		// GC end
+		MonoProfilerGCEvent::PostStartWorldUnlocked => {
+			if let Some(gct) = td.gc_clock
+			{
+				let now = Instant::now();
+				let time = now.duration_since(gct);
+				td.gc_timings.calls += 1;
+				td.gc_timings.total_time += time;
+				#[cfg(debug_assertions)]
+				{
+					println!("gc time: {} - {} -------------------------------------", time.as_micros(), td.main)
+				}
+			}
+		},
+		_ => {}
+	}
+}
+
+pub unsafe extern "C" fn gc_alloc_cb<const CALL: bool, const ADV: bool>(profiler: &MonoProfiler, object: &MonoObject)
+{
+	if !profiler.profiler_recording {return;}
 	let td = get_thread_data();
 	assert_main_domain!(profiler, td, ());
-	let object= &*obj_ptr;
 	let alloc = get_sizeof_object(profiler, object) as u64;
-	if profiler.args.contains(ProfilerArgs::CallMemory) {
+	if CALL {
 		if let Some(frame) = td.stack.last_mut()
 		{
 			frame.own_allocations += alloc;
 			frame.total_allocations += alloc;
 		};
 	}
-	if profiler.args.contains(ProfilerArgs::AdvancedMemory) {
+	if ADV {
 		let klass = (*object.vtable).klass;
 		if klass.is_null() {return;}
 		let entry = td.memory_recording.entry(klass).or_insert_with(||{
@@ -860,15 +967,47 @@ pub unsafe extern "C" fn gc_alloc_cb(profiler: &MonoProfiler, obj_ptr: *const Mo
 }
 
 #[inline]
-pub unsafe extern "C" fn enter_method(profiler: &MonoProfiler, method: &MonoMethod, _ctx: *const MonoProfilerCallContext)
+pub unsafe extern "C" fn method_enter<const TIMED: bool>(profiler: &MonoProfiler, method: &MonoMethod, _ctx: *const MonoProfilerCallContext)
 {
 	if !profiler.profiler_recording { return; }
 	let td = get_thread_data();
 	assert_main_domain!(profiler, td, ());
-	td.stack.push(StackFrame::new(method, td.main && profiler.args.contains(ProfilerArgs::Timings)));
+	td.stack.push(StackFrame::new(method, if TIMED && td.main
+	{
+		Some(StackTiming
+		{
+			time: Instant::now(),
+			others: Duration::ZERO
+		})
+	}
+	else {
+		None
+	}));
 }
 
-pub unsafe extern "C" fn exit_method(profiler: &MonoProfiler, method_ptr: *const MonoMethod, _ctx: *const MonoProfilerCallContext)
+pub unsafe extern "C" fn exception_thrown(profiler: &MonoProfiler, _obj: &MonoObject)
+{
+	if !profiler.profiler_recording { return; }
+
+	let td = get_thread_data();
+
+	if let Some(frame) = td.stack.last_mut()
+	{
+		#[cfg(debug_assertions)]
+		{
+			println!("root exception in {}", (*frame.method).get_name());
+		}
+		let result: &mut MethodResult = td.call_recording.entry(frame.method).or_default();
+		result.own_exceptions += 1;
+	};
+}
+
+pub unsafe extern "C" fn method_leave<const TIMED: bool>(profiler: &MonoProfiler, method_ptr: *const MonoMethod, _ctx: *const MonoProfilerCallContext)
+{
+	exit_method::<TIMED>(profiler, method_ptr, false);
+}
+#[inline]
+pub unsafe fn exit_method<const TIMED: bool>(profiler: &MonoProfiler, method_ptr: *const MonoMethod, exceptional: bool)
 {
 	if !profiler.profiler_recording { return; }
 
@@ -891,6 +1030,13 @@ pub unsafe extern "C" fn exit_method(profiler: &MonoProfiler, method_ptr: *const
 		}
 	};
 
+	let maybe_now: Option<Instant> = if TIMED && /* only some on main thread */ frame.time.is_some() {
+		Some(Instant::now())
+	}
+	else {
+		None
+	};
+
 	let result: &mut MethodResult = td.call_recording.entry(method_ptr).or_default();
 
 	result.calls += 1;
@@ -900,31 +1046,43 @@ pub unsafe extern "C" fn exit_method(profiler: &MonoProfiler, method_ptr: *const
 	let total_alloc = frame.total_allocations;
 
 	result.total_allocations += total_alloc;
+	
+	if exceptional
+	{
+		result.total_exceptions += 1;
+	}
 
 	let mut total_time: Duration = Duration::ZERO;
-
-	if let Some(frame_time) = &frame.time
-	{
-		let now = Instant::now();
-		total_time = now.duration_since(frame_time.time);
-		result.total_time += total_time;
-		result.own_time += total_time - frame_time.others;
+	if TIMED {
+		if let Some(now) = &maybe_now
+		{
+			let frame_time = frame.time.as_ref().unwrap_unchecked();
+			total_time = now.duration_since(frame_time.time);
+			result.total_time += total_time;
+			result.own_time += total_time - frame_time.others;
+		}
 	}
 
 	if let Some(prev_idx) = idx.checked_sub(1)
 	{
 		let prev = td.stack.get_unchecked_mut(prev_idx);
 		prev.total_allocations += total_alloc;
-		if let Some(prev_time) = &mut prev.time
-		{
-			prev_time.others += total_time;
+		if TIMED {
+			if let Some(prev_time) = &mut prev.time
+			{
+				prev_time.others += total_time;
+			}
 		}
 	}
 
 	td.stack.truncate(idx);
 }
 
-pub unsafe extern "C" fn method_exception(profiler: &MonoProfiler, method: *const MonoMethod, _exception: *const MonoObject)
+pub unsafe extern "C" fn method_exception_leave<const TIMED: bool>(profiler: &MonoProfiler, method: *const MonoMethod, _exception: *const MonoObject)
 {
-	exit_method(profiler, method, ptr::null());
+	#[cfg(debug_assertions)]
+	{
+		println!("exception in {}", (*method).get_name());
+	}
+	exit_method::<TIMED>(profiler, method, true);
 }
