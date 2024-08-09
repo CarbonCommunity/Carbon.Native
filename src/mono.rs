@@ -1,3 +1,9 @@
+/*
+ *
+ * Copyright (c) mono, under the MIT license rights
+ *
+ */
+
 use std::ffi::{c_char, CStr};
 use std::mem::transmute;
 use std::slice;
