@@ -1,3 +1,5 @@
+#![feature(fn_ptr_trait)]
+#![feature(core_intrinsics)]
 /*
  *
  * Copyright (c) 2024 Carbon Community
@@ -8,10 +10,6 @@
 
 use std::ffi::{c_char, CStr};
 
-//mod compiler;
-//mod coreclr;
-//mod plugins;
-//mod native_array_manager;
 mod profiler;
 mod mono;
 
@@ -86,18 +84,23 @@ macro_rules! deref_or_ret {
 
 pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str>
 {
-	return match ptr.is_null()  {
+	match ptr.is_null()  {
 		true => None,
 		false => Some(CStr::from_ptr(ptr).to_str().unwrap())
-	};
+	}
 }
 
 pub unsafe fn read_cstr_default(ptr: *const c_char, default: impl FnOnce() -> String) -> String
 {
-	return match read_cstr(ptr)  {
+	match read_cstr(ptr)  {
 		None => default(),
 		Some(x) => x.to_string()
-	};
+	}
+}
+
+pub unsafe fn read_cstr_default_static(ptr: *const c_char, default: &'static str) -> &str
+{
+	read_cstr(ptr).unwrap_or(default)
 }
 
 pub fn log_mono_internal(severity: Severity, msg: &str, source: LogSource, verb: i32)
@@ -163,6 +166,6 @@ pub enum LogSource
 mod tests {
 	#[test]
 	fn test() {
-		
+
 	}
 }

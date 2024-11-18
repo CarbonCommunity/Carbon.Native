@@ -1,20 +1,47 @@
 use std::ffi::{c_char, CStr};
 use std::mem::transmute;
-use std::slice;
+use std::ptr::NonNull;
+use std::{ptr, slice};
 
 use bitflags::bitflags;
+#[cfg(target_os = "linux")]
+use libc::ucontext_t;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+#[cfg(target_os = "windows")]
+pub type ThreadContext = CONTEXT;
+#[cfg(target_os = "linux")]
+pub type ThreadContext = ucontext_t;
+
+#[cfg(target_os = "linux")]
+use libc::pthread_t;
+#[cfg(target_os = "windows")]
+pub type SysThread = *const ();
+#[cfg(target_os = "linux")]
+pub type SysThread = pthread_t;
+
 
 use crate::profiler::MonoProfiler;
 
 #[cfg_attr(target_os = "windows", link(name = "mono-2.0-bdwgc", kind = "raw-dylib"))]
 #[cfg_attr(target_os = "linux", link(name = "monobdwgc-2.0", kind = "dylib"))]
 extern "C" {
-	fn mono_free(ptr: *mut ());
+	#[link_name = "mono_free"]
+	pub fn __internal__mono_free(ptr: *mut ());
 	pub fn mono_type_get_name_full(mtype: *const MonoType, format: MonoTypeNameFormat) -> *mut c_char;
-	pub fn mono_get_string_class() -> *const MonoClass;
+	pub fn mono_get_corlib() -> &'static MonoImage;
+	pub fn mono_get_string_class() -> &'static MonoClass;
 	pub fn mono_string_new_len(domain: *const MonoDomain, utf8: *const u8, len: u32) -> *const MonoString;
 	pub fn mono_domain_get() -> *const MonoDomain;
 	pub fn mono_gc_is_incremental() -> bool;
+	#[link_name = "mono_object_get_size_internal"]
+	pub fn mono_object_get_size(object: NonNull<MonoObject>) -> u32;
+	#[link_name = "mono_stack_walk_async_safe"]
+	pub fn __internal_mono_stack_walk_async_safe(func: *const (), ctx: &ThreadContext, ud: *mut ());
+	#[link_name = "mono_stack_walk"]
+	pub fn __internal_mono_stack_walk(func: *const (), ud: *mut ());
+	#[link_name = "mono_stack_walk_no_il"]
+	pub fn __internal_mono_stack_walk_no_il(func: *const (), ud: *mut ());
 	pub fn mono_profiler_enable_allocations() -> bool;
 	pub fn mono_profiler_set_exception_throw_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoObject)>);
 	pub fn mono_profiler_set_gc_event_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, MonoProfilerGCEvent, u32, bool)>);
@@ -36,12 +63,33 @@ pub type GCAllocCB = unsafe extern "C" fn(&MonoProfiler, &MonoObject);
 
 pub unsafe fn mono_free_g<T>(ptr: *mut T)
 {
-	mono_free(transmute(ptr));
+	__internal__mono_free(transmute(ptr));
+}
+
+pub type AsyncStackWalkFunc<T> = unsafe extern "C" fn(Option<&MonoMethod>, *const MonoDomain, ji_code_start: *const (), native_offset: i32, userdata: &mut T) -> bool;
+pub type StackWalkFunc<T> = unsafe extern "C" fn(Option<&MonoMethod>, native_offset: i32, il_offset: i32, is_managed: bool, userdata: &mut T) -> bool;
+
+#[inline]
+pub unsafe fn mono_stack_walk_async<T>(cb: AsyncStackWalkFunc<T>, ctx: &ThreadContext, data: &mut T)
+{
+	__internal_mono_stack_walk_async_safe(cb as *const (), ctx, data as *mut T as *mut ());
+}
+
+#[inline]
+pub unsafe fn mono_stack_walk<const NO_IL: bool, T>(cb: StackWalkFunc<T>, data: &mut T)
+{
+	if NO_IL {
+		__internal_mono_stack_walk_no_il(cb as *const (), data as *mut T as *mut ());
+	}
+	else {
+		__internal_mono_stack_walk(cb as *const (), data as *mut T as *mut ());
+	}
 }
 
 pub struct MonoDefaults
 {
-	pub string_class: *const MonoClass
+	pub string_class: &'static MonoClass,
+	pub corlib: &'static MonoImage
 }
 
 impl MonoDefaults
@@ -50,7 +98,8 @@ impl MonoDefaults
 	{
 		unsafe {
 			MonoDefaults {
-				string_class: mono_get_string_class()
+				string_class: mono_get_string_class(),
+				corlib: mono_get_corlib()
 			}
 		}
 	}
@@ -58,7 +107,7 @@ impl MonoDefaults
 
 unsafe impl Sync for MonoProfiler
 {
-	
+
 }
 
 pub static mut PROFILER: Option<MonoProfiler> = None;
@@ -67,25 +116,25 @@ pub static mut PROFILER: Option<MonoProfiler> = None;
 bitflags! {
 	pub struct CallInstrumentationFlags : u8
 	{
-	
+
 		///Do not instrument calls.
 		const None = 0;
-		
+
 		/// Instrument method entries.
 		const Enter = 1 << 1;
-		
+
 		/// Also capture a call context for method entries.
 		const EnterContext = 1 << 2;
-		
+
 		/// Instrument method exits.
 		const Leave = 1 << 3;
-		
+
 		/// Also capture a call context for method exits.
 		const LeaveContext = 1 << 4;
-	
+
 		/// Instrument method exits as a result of a tail call.
 		const TailCall = 1 << 5;
-	
+
 		///Instrument exceptional method exits.
 		const ExceptionLeave = 1 << 6;
 	}
@@ -98,7 +147,7 @@ pub struct MonoMethod
 	pub flags: u16,
 	pub iflags: u16,
 	pub token: u32,
-	pub class: *const MonoClass,
+	pub class: &'static MonoClass,
 	pub signature: *const (),
 	pub name: *const c_char,
 	/*#ifdef IL2CPP_ON_MONO
@@ -151,7 +200,7 @@ pub fn get_method_full_name(method: &MonoMethod, format: MonoTypeNameFormat) -> 
 {
 	unsafe {
 		let nameptr = mono_type_get_name_full(&(*method.class)._byval_arg, format);
-		
+
 		let ret = format!("{}::{}", CStr::from_ptr(nameptr).to_str().unwrap(), CStr::from_ptr(method.name).to_str().unwrap());
 		mono_free_g(nameptr);
 		ret
@@ -185,7 +234,7 @@ pub struct MonoClass {
 	pub cast_class: *const MonoClass,
 
 	/* for fast subtype checks */
-	pub supertypes: *const *const MonoClass, 
+	pub supertypes: *const *const MonoClass,
 	pub idepth: guint16,
 
 	/* array dimension */
@@ -197,15 +246,15 @@ pub struct MonoClass {
 	pub instance_size: int, /* object instance size */
 
 	// C bitfield bullshit
-	
+
 	/*pub inited: guint,
 
 	/* A class contains static and non static data. Static data can be
 	 * of the same type as the class itselfs, but it does not influence
-	 * the instance size of the class. To avoid cyclic calls to 
+	 * the instance size of the class. To avoid cyclic calls to
 	 * mono_class_init_internal (from mono_class_instance_size ()) we first
-	 * initialise all non static fields. After that we set size_inited 
-	 * to 1, because we know the instance size now. After that we 
+	 * initialise all non static fields. After that we set size_inited
+	 * to 1, because we know the instance size now. After that we
 	 * initialise all static fields.
 	 */
 
@@ -218,7 +267,7 @@ pub struct MonoClass {
 	pub wastypebuilder  : guint, /* class was created at runtime from a TypeBuilder */
 	pub is_array_special_interface : guint, /* gtd or ginst of once of the magic interfaces that arrays implement */
 	pub is_byreflike    : guint, /* class is a valuetype and has System.Runtime.CompilerServices.IsByRefLikeAttribute */*/
-	
+
 	#[cfg(target_os = "windows")] // aaaaaaaaaaaaaaaaaa
 	_pd1: [u8; 4],
 
@@ -258,12 +307,12 @@ pub struct MonoClass {
 	pub has_dim_conflicts : guint, /* Class has conflicting default interface methods */ */
 	#[cfg(target_os = "windows")]
 	_pd2: [u8; 4],
-	
+
 
 	pub parent: *const MonoClass,
 	pub nested_in: *const MonoClass,
 
-	pub image: *const MonoImage,
+	pub image: &'static MonoImage,
 	pub name: *const c_char,
 	pub name_space: *const c_char,
 
@@ -316,7 +365,7 @@ pub union MonoClassSizes {
 #[repr(C)]
 pub struct MonoObject
 {
-	pub vtable: *const MonoVTable,
+	pub vtable: &'static MonoVTable,
 	pub sync: *const MonoThreadsSync,
 }
 
@@ -327,11 +376,11 @@ impl MonoObject {
 			match &PROFILER {
 				None => None,
 				Some(x) => {
-					if (*self.vtable).klass == x.mono_defaults.string_class
+					if ptr::eq(self.vtable.klass, x.mono_defaults.string_class)
 					{
 						Some(transmute(self))
 					}
-					else { 
+					else {
 						None
 					}
 				}
@@ -405,7 +454,7 @@ impl<T> TypedMonoArray<T>
 				return Some(slice::from_raw_parts(self.data, self.length as usize));
 			}
 
-			return None;
+			None
 		}
 	}
 	pub fn get_mut(&mut self) -> Option<&mut [T]>
@@ -415,7 +464,7 @@ impl<T> TypedMonoArray<T>
 				return Some(slice::from_raw_parts_mut(self.data, self.length as usize));
 			}
 
-			return None;
+			None
 		}
 	}
 }
@@ -452,8 +501,8 @@ pub type int = i32;
 pub type MonoThreadsSync = ();
 #[repr(C)]
 pub struct MonoVTable
-{ 
-	pub klass: *const MonoClass,
+{
+	pub klass: &'static MonoClass,
 	/*
 	* According to comments in gc_gcj.h, this should be the second word in
 	* the vtable.
@@ -759,37 +808,6 @@ pub struct MonoImage
 	
 	 */
 }
-#[repr(C)]
-pub struct MonoProfilerCallContext
-{
-	/*
- 	 * Must be the first field (the JIT relies on it). Only filled out if this
- 	 * is a JIT frame; otherwise, zeroed.
- 	 */
-	context: MonoContext,
-	/*
-	 * A non-NULL MonoInterpFrameHandle if this is an interpreter frame.
-	 */
-	interp_frame: *const (),
-	method: *const MonoMethod,
-	/*
-	 * Points to the return value for an epilogue context. For a prologue, this
-	 * is set to NULL.
-	 */
-	return_value: *const (),
-	/*
-	 * Points to an array of addresses of stack slots holding the arguments.
-	 */
-	args: *const *const ()
-}
-#[repr(C)]
-pub struct MonoContext
-{
-	regs: [usize; 15],
-	ip: *const guint8,
-	sp: *const *const (),
-	fp: *const *const (),
-}
 #[repr(u8)]
 pub enum MonoTypeNameFormat {
 	IL,
@@ -862,6 +880,7 @@ pub union MonoTypeUnion
 	pub generic_param: *const MonoGenericParam, /* for VAR and MVAR */
 	pub generic_class: *const MonoGenericClass /* for GENERICINST */
 }
+pub type MonoProfilerCallContext = ();
 pub type MonoArrayType = ();
 pub type MonoGenericClass = ();
 pub type MonoGenericParam = ();
