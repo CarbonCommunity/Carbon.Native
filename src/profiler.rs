@@ -1,8 +1,7 @@
 /*
  *
- * Copyright (c) 2024 Carbon Community
- * Copyright (c) 2024 Patrette
- * All rights reserved.
+ * Copyright (c) 2023-2024 Patrette, under the GNU v3 license rights
+ * Copyright (c) 2023-2024 Carbon Community, under the GNU v3 license rights
  *
  */
 
