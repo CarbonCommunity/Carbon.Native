@@ -1,5 +1,3 @@
-#![feature(fn_ptr_trait)]
-#![feature(core_intrinsics)]
 /*
  *
  * Copyright (c) 2023-2024 Patrette, under the GNU v3 license rights
