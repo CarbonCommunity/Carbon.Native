@@ -10,7 +10,7 @@ use std::ffi::{c_char, CStr};
 mod profiler;
 mod mono;
 
-pub const PROTOCOL: u64 = 3;
+pub const PROTOCOL: u64 = 4;
 
 #[no_mangle]
 pub unsafe extern "system" fn carbon_get_protocol() -> u64
