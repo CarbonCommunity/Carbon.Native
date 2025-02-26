@@ -13,10 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::mem::transmute;
 use std::ptr::NonNull;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, mem, ptr, slice, thread};
-use arrayvec::{ArrayVec, CapacityError};
+use arrayvec::{ArrayVec};
 use crate::mono::*;
 use crate::{assert_main_domain, deref_or_ret, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret};
 
@@ -485,7 +485,7 @@ impl Default for MemoryRecord
 }
 pub type BasicIter<'a> = (Iter<'a, *const MonoImage, PluginResults>, f64);
 pub type AdvIter<'a> = (Iter<'a, *const MonoMethod, MethodResult>, f64);
-pub type MemoryIter<'a> = (Iter<'a, *const MonoClass, MemoryResult>);
+pub type MemoryIter<'a> = Iter<'a, *const MonoClass, MemoryResult>;
 
 #[no_mangle]
 pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, image_ptr: *const MonoImage)
@@ -584,7 +584,7 @@ pub unsafe extern "C" fn profiler_alloc_push() -> bool {
 		Ok(_) => {
 			true
 		},
-		Err(e) => {
+		Err(_e) => {
 			td.alloc_stack_overflow+=1;
 			false
 		}
@@ -893,7 +893,7 @@ pub unsafe extern "system" fn profiler_toggle(
 	}
 
 	unsafe extern "system" fn iter_memory_fn(
-		(iter): &mut MemoryIter,
+		iter: &mut MemoryIter,
 		out: &mut MemoryRecord
 	) -> bool
 	{
@@ -933,7 +933,7 @@ pub unsafe extern "system" fn profiler_toggle(
 }*/
 
 #[cfg(debug_assertions)]
-pub unsafe extern "C" fn method_free(_profiler: &MonoProfiler, method: &MonoMethod)
+pub unsafe extern "C" fn method_free(_profiler: &MonoProfiler, _method: &MonoMethod)
 {
 	//debug_log_method(method);
 	println!("method free");
