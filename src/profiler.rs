@@ -1009,10 +1009,6 @@ pub unsafe extern "C" fn gc_collect_cb(profiler: &MonoProfiler, event: MonoProfi
 
 	// https://github.com/Unity-Technologies/mono/blob/1c8577ecab30c96474982a3bcfaf4ab2d84fef7a/mono/metadata/boehm-gc.c#L556
 	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
-	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
-	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
-	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
-	// https://github.com/ivmai/bdwgc/blob/67090a19904291db97ec3a76eb6ae420f3564cea/alloc.c#L825
 	match event {
 		// GC start
 		MonoProfilerGCEvent::PreStopWorld => {
@@ -1028,7 +1024,7 @@ pub unsafe extern "C" fn gc_collect_cb(profiler: &MonoProfiler, event: MonoProfi
 				td.gc_timings.total_time += time;
 				#[cfg(debug_assertions)]
 				{
-					println!("gcasdf time: {} - {} -------------------------------------", time.as_micros(), td.main)
+					println!("gc time: {} - {} -------------------------------------", time.as_micros(), td.main)
 				}
 			}
 		},
