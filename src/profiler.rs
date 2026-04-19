@@ -6,17 +6,17 @@
  */
 
 use bitflags::bitflags;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::hash_map::{Entry, Iter};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::mem::transmute;
 use std::ptr::NonNull;
-use std::sync::{Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{fs, mem, ptr, slice, thread};
-use arrayvec::{ArrayVec};
+use arrayvec::ArrayVec;
 use crate::mono::*;
 use crate::{assert_main_domain, deref_or_ret, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret};
 
