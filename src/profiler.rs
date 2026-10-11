@@ -15,10 +15,10 @@ use std::mem::transmute;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::{fs, mem, ptr, slice, thread};
+use std::{fs, io, mem, ptr, slice, thread};
 use arrayvec::ArrayVec;
 use crate::mono::*;
-use crate::{assert_main_domain, deref_or_ret, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret};
+use crate::{assert_main_domain, deref_or_ret, log_mono_native_host, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret, Severity};
 
 thread_local! {
 	pub static THREAD_DATA: Cell<*mut ThreadData> = const { Cell::new(ptr::null_mut()) }
@@ -158,7 +158,8 @@ pub struct ManagedCallbacks
 	pub mem_iter: MemoryIterCallback
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProfilerConfig
 {
 	#[serde(rename = "Enabled")]
@@ -177,6 +178,23 @@ pub struct ProfilerConfig
 	pub extensions: Vec<String>,
 	#[serde(rename = "Harmony")]
 	pub harmony: Vec<String>
+}
+
+impl Default for ProfilerConfig
+{
+	fn default() -> Self
+	{
+		ProfilerConfig {
+			enabled: false,
+			instrument_methods: true,
+			sourceviewer: false,
+			assemblies: Vec::new(),
+			plugins: Vec::new(),
+			modules: Vec::new(),
+			extensions: Vec::new(),
+			harmony: Vec::new()
+		}
+	}
 }
 
 pub struct RuntimeData
@@ -237,9 +255,13 @@ pub struct PluginResults
 	pub exceptions: u64
 }
 
-pub fn load_config(path: &str) -> anyhow::Result<ProfilerConfig>
+pub fn load_config(path: &str) -> anyhow::Result<Option<ProfilerConfig>>
 {
-	anyhow::Ok(serde_json::from_slice(fs::read(path)?.as_slice())?)
+	match fs::read(path) {
+		Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error.into())
+	}
 }
 
 pub fn get_default_config(path: &str) -> ProfilerConfig
@@ -260,8 +282,12 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 		let pstr = String::from_utf16(slice::from_raw_parts(cfg_ptr, cfg_len as usize)).unwrap();
 		let cfg = match load_config(pstr.as_str())
 		{
-			Ok(x) => x,
-			Err(_) => get_default_config(pstr.as_str())
+			Ok(Some(x)) => x,
+			Ok(None) => get_default_config(pstr.as_str()),
+			Err(error) => {
+				log_mono_native_host(Severity::Error, &format!("Profiler disabled, cannot read {pstr}: {error}"));
+				return;
+			}
 		};
 
 		if !cfg.enabled {return;}
