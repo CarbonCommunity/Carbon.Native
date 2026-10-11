@@ -12,7 +12,7 @@ mod profiler;
 mod mono;
 mod recording;
 
-pub const PROTOCOL: u64 = 4;
+pub const PROTOCOL: u64 = 5;
 
 #[no_mangle]
 pub unsafe extern "system" fn carbon_get_protocol() -> u64

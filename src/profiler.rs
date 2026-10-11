@@ -19,6 +19,7 @@ use crate::recording::{percentage_of, AllocationScopes, CallRecorder, MemoryReco
 use crate::{log_mono_native_host, ok_or_ret, read_cstr, read_cstr_default, run_ffi_safe, some_or_ret, Severity};
 
 pub static PROFILER: OnceLock<MonoProfiler> = OnceLock::new();
+static CALLBACKS: Mutex<Option<ManagedCallbacks>> = Mutex::new(None);
 
 thread_local! {
 	static THREAD_STATE: ThreadState = const {
@@ -135,6 +136,11 @@ fn record(profiler: &MonoProfiler, edit: impl FnOnce(&mut ThreadRecording, bool)
 	});
 }
 
+fn callbacks() -> Option<ManagedCallbacks>
+{
+	CALLBACKS.lock().ok().and_then(|callbacks| *callbacks)
+}
+
 fn is_main_thread() -> bool
 {
 	THREAD_STATE.try_with(|state| state.slot.get().is_some_and(|slot| slot.main)).unwrap_or(false)
@@ -157,7 +163,6 @@ pub struct MonoProfiler
 	pub sync: Mutex<ProfilerSynced>,
 	pub mono_defaults: MonoDefaults,
 	pub threads: Mutex<Vec<Arc<ThreadSlot>>>,
-	pub callbacks: Mutex<Option<ManagedCallbacks>>,
 	pub freed_methods: Mutex<FxHashSet<*const MonoMethod>>,
 	pub epoch: Instant,
 	pub gc: GcClock,
@@ -188,11 +193,6 @@ impl MonoProfiler
 	fn handle(&self) -> MonoProfilerHandle
 	{
 		self.handle.load(Ordering::Relaxed)
-	}
-
-	fn callbacks(&self) -> Option<ManagedCallbacks>
-	{
-		self.callbacks.lock().ok().and_then(|callbacks| *callbacks)
 	}
 
 	fn elapsed_nanos(&self) -> u64
@@ -329,70 +329,84 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 			return;
 		}
 
-		let pstr = String::from_utf16_lossy(slice::from_raw_parts(cfg_ptr, cfg_len as usize));
-		let cfg = match load_config(pstr.as_str())
-		{
-			Ok(Some(x)) => x,
-			Ok(None) => get_default_config(pstr.as_str()),
-			Err(error) => {
-				log_mono_native_host(Severity::Error, &format!("Profiler disabled, cannot read {pstr}: {error}"));
-				return;
-			}
-		};
-
-		if !cfg.enabled {return;}
-
-		//init_detour();
-
-		let instrument_methods = cfg.instrument_methods;
-		let has_assemblies = !cfg.assemblies.is_empty();
-
-		let mp = PROFILER.get_or_init(|| MonoProfiler {
-			main_domain: mono_domain_get(),
-			gc_alloc_stack_tracking: AtomicBool::new(false),
-			callbacks: Mutex::new(None),
-			profiler_recording: AtomicBool::new(false),
-			args: AtomicU16::new(ProfilerArgs::None.bits()),
-			handle: AtomicPtr::new(ptr::null_mut()),
-			sync: Mutex::new(ProfilerSynced {
-				config: cfg,
-				profiler_images: Default::default(),
-				runtime: None,
-			}),
-			mono_defaults: MonoDefaults::new(),
-			threads: Mutex::new(Vec::new()),
-			freed_methods: Mutex::new(FxHashSet::default()),
-			epoch: Instant::now(),
-			gc: GcClock::default(),
-			allocations_enabled: AtomicBool::new(false),
-			filter_installed: AtomicBool::new(false)
-		});
-
-		#[cfg(debug_assertions)]
-		{
-			println!("gc incremental: {}", mono_gc_is_incremental());
-		}
-
-		THREAD_STATE.with(|state| {
-			state.slot.get_or_init(|| mp.register_thread(true));
-		});
-
-		let handle = mono_profiler_create(ptr::from_ref(mp).cast_mut());
-		mp.handle.store(handle.cast_mut(), Ordering::Relaxed);
-
-		mono_profiler_set_method_free_callback(handle, Some(method_free));
-
-		if instrument_methods && has_assemblies {
-			mp.install_filter();
-			mono_profiler_set_image_loaded_callback(handle, Some(image_loaded));
-		}
-		#[cfg(debug_assertions)]
-		{
-			println!("mono profiler started {:2x}", handle as usize);
-		}
-
-		return;
+		initialize(cfg_ptr, cfg_len, false);
 	})
+}
+
+/// Starts the profiler regardless of the config's Enabled flag. Call it on the main thread.
+#[no_mangle]
+pub unsafe extern "system" fn start_profiler(cfg_ptr: *const u16, cfg_len: i32) -> bool
+{
+	run_ffi_safe!("start_profiler", false, {
+		if PROFILER.get().is_none() {
+			initialize(cfg_ptr, cfg_len, true);
+		}
+		PROFILER.get().is_some()
+	})
+}
+
+unsafe fn initialize(cfg_ptr: *const u16, cfg_len: i32, ignore_enabled: bool)
+{
+	let pstr = String::from_utf16_lossy(slice::from_raw_parts(cfg_ptr, cfg_len as usize));
+	let cfg = match load_config(pstr.as_str())
+	{
+		Ok(Some(x)) => x,
+		Ok(None) => get_default_config(pstr.as_str()),
+		Err(error) => {
+			log_mono_native_host(Severity::Error, &format!("Profiler disabled, cannot read {pstr}: {error}"));
+			return;
+		}
+	};
+
+	if !cfg.enabled && !ignore_enabled {return;}
+
+	//init_detour();
+
+	let instrument_methods = cfg.instrument_methods;
+	let has_assemblies = !cfg.assemblies.is_empty();
+
+	let mp = PROFILER.get_or_init(|| MonoProfiler {
+		main_domain: mono_domain_get(),
+		gc_alloc_stack_tracking: AtomicBool::new(false),
+		profiler_recording: AtomicBool::new(false),
+		args: AtomicU16::new(ProfilerArgs::None.bits()),
+		handle: AtomicPtr::new(ptr::null_mut()),
+		sync: Mutex::new(ProfilerSynced {
+			config: cfg,
+			profiler_images: Default::default(),
+			runtime: None,
+		}),
+		mono_defaults: MonoDefaults::new(),
+		threads: Mutex::new(Vec::new()),
+		freed_methods: Mutex::new(FxHashSet::default()),
+		epoch: Instant::now(),
+		gc: GcClock::default(),
+		allocations_enabled: AtomicBool::new(false),
+		filter_installed: AtomicBool::new(false)
+	});
+
+	#[cfg(debug_assertions)]
+	{
+		println!("gc incremental: {}", mono_gc_is_incremental());
+	}
+
+	THREAD_STATE.with(|state| {
+		state.slot.get_or_init(|| mp.register_thread(true));
+	});
+
+	let handle = mono_profiler_create(ptr::from_ref(mp).cast_mut());
+	mp.handle.store(handle.cast_mut(), Ordering::Relaxed);
+
+	mono_profiler_set_method_free_callback(handle, Some(method_free));
+
+	if instrument_methods && has_assemblies {
+		mp.install_filter();
+		mono_profiler_set_image_loaded_callback(handle, Some(image_loaded));
+	}
+	#[cfg(debug_assertions)]
+	{
+		println!("mono profiler started {:2x}", handle as usize);
+	}
 }
 
 #[no_mangle]
@@ -570,7 +584,7 @@ pub type MemoryIter<'a> = Iter<'a, *const MonoClass, MemoryResult>;
 #[no_mangle]
 pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, image_ptr: *const MonoImage)
 {
-	let callbacks = some_or_ret!(PROFILER.get().and_then(MonoProfiler::callbacks), ());
+	let callbacks = some_or_ret!(callbacks(), ());
 	if image_ptr.is_null() {return;}
 	if let Some(cs) = read_cstr(mono_image_get_name(image_ptr))
 	{
@@ -582,7 +596,7 @@ pub unsafe extern "system" fn get_image_name(managed: &mut *const MonoString, im
 #[no_mangle]
 pub unsafe extern "system" fn get_method_name(managed: &mut *const MonoString, method_ptr: *const MonoMethod)
 {
-	let callbacks = some_or_ret!(PROFILER.get().and_then(MonoProfiler::callbacks), ());
+	let callbacks = some_or_ret!(callbacks(), ());
 	if method_ptr.is_null() {return;}
 	let full_name = get_method_full_name(method_ptr, MonoTypeNameFormat::FullName);
 	(callbacks.string_marshal)(managed, full_name.as_ptr(), full_name.len() as i32);
@@ -591,7 +605,7 @@ pub unsafe extern "system" fn get_method_name(managed: &mut *const MonoString, m
 #[no_mangle]
 pub unsafe extern "system" fn get_class_name(managed: &mut *const MonoString, class_ptr: *const MonoClass)
 {
-	let callbacks = some_or_ret!(PROFILER.get().and_then(MonoProfiler::callbacks), ());
+	let callbacks = some_or_ret!(callbacks(), ());
 	if class_ptr.is_null() {return;}
 	let nameptr = mono_type_get_name_full(mono_class_get_type(class_ptr), MonoTypeNameFormat::FullName);
 	if let Some(full_name) = read_cstr(nameptr)
@@ -605,8 +619,7 @@ pub unsafe extern "system" fn get_class_name(managed: &mut *const MonoString, cl
 #[no_mangle]
 pub unsafe extern "system" fn profiler_register_callbacks(callbacks: &ManagedCallbacks)
 {
-	let profiler = some_or_ret!(PROFILER.get(), ());
-	if let Ok(mut registered) = profiler.callbacks.lock() {
+	if let Ok(mut registered) = CALLBACKS.lock() {
 		*registered = Some(*callbacks);
 	}
 }
@@ -676,7 +689,7 @@ pub unsafe extern "system" fn profiler_toggle(
 		if !is_main_thread() {return ProfilerResultCode::MainThreadOnly;}
 		let mut others = ok_or_ret!(profiler.threads.lock(), ProfilerResultCode::CorruptedState);
 		let mut sync = ok_or_ret!(profiler.sync.lock(), ProfilerResultCode::CorruptedState);
-		let callbacks = some_or_ret!(profiler.callbacks(), ProfilerResultCode::NotInitialized);
+		let callbacks = some_or_ret!(callbacks(), ProfilerResultCode::NotInitialized);
 		match !profiler.is_recording() {
 			true => {
 				if args.contains(ProfilerArgs::Abort)
