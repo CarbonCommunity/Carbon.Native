@@ -49,8 +49,8 @@ extern "C" {
 	#[link_name = "mono_stack_walk_no_il"]
 	pub fn __internal_mono_stack_walk_no_il(func: *const (), ud: *mut ());
 	pub fn mono_profiler_enable_allocations() -> bool;
-	pub fn mono_profiler_set_exception_throw_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoObject)>);
-	pub fn mono_profiler_set_gc_event_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, MonoProfilerGCEvent, u32, bool)>);
+	pub fn mono_profiler_set_exception_throw_callback(handle: MonoProfilerHandle, cb: Option<ExceptionThrownCB>);
+	pub fn mono_profiler_set_gc_event_callback(handle: MonoProfilerHandle, cb: Option<GCEventCB>);
 	pub fn mono_profiler_set_gc_allocation_callback(handle: MonoProfilerHandle, cb: Option<GCAllocCB>);
 	pub fn mono_profiler_set_image_loaded_callback(handle: MonoProfilerHandle, cb: Option<unsafe extern "C" fn(&MonoProfiler, &MonoImage)>);
 	pub fn mono_profiler_set_method_enter_callback(handle: MonoProfilerHandle, cb: Option<EnterCB>);
@@ -66,6 +66,8 @@ pub type EnterCB = unsafe extern "C" fn(&MonoProfiler, &MonoMethod, *const MonoP
 pub type ExitCB = unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoProfilerCallContext);
 pub type ExceptionalExitCB = unsafe extern "C" fn(&MonoProfiler, *const MonoMethod, *const MonoObject);
 pub type GCAllocCB = unsafe extern "C" fn(&MonoProfiler, &MonoObject);
+pub type ExceptionThrownCB = unsafe extern "C" fn(&MonoProfiler, &MonoObject);
+pub type GCEventCB = unsafe extern "C" fn(&MonoProfiler, MonoProfilerGCEvent, u32, bool);
 
 pub unsafe fn mono_free_g<T>(ptr: *mut T)
 {

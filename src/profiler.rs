@@ -665,76 +665,7 @@ pub unsafe extern "system" fn profiler_toggle(
 				}
 
 				if !args.contains(ProfilerArgs::FastResume) {
-					let mut any = false;
-
-					let stack = sync.config.instrument_methods && args.contains(ProfilerArgs::Stack);
-
-					let call_memory = (stack || args.contains(ProfilerArgs::StackWalkAllocations)) && args.contains(ProfilerArgs::CallMemory);
-
-					if stack
-					{
-						any = true;
-						let enter: EnterCB;
-						let exit: ExitCB;
-						let exception: ExceptionalExitCB;
-						if args.contains(ProfilerArgs::Timings) {
-							enter = method_enter::<true>;
-							exit = method_leave::<true>;
-							exception = method_exception_leave::<true>;
-						}
-						else
-						{
-							enter = method_enter::<false>;
-							exit = method_leave::<false>;
-							exception = method_exception_leave::<false>;
-						}
-						mono_profiler_set_method_enter_callback(profiler.handle, Some(enter));
-						mono_profiler_set_method_leave_callback(profiler.handle, Some(exit));
-						mono_profiler_set_method_exception_leave_callback(profiler.handle, Some(exception));
-						mono_profiler_set_exception_throw_callback(profiler.handle, Some(exception_thrown));
-					}
-
-					if call_memory || args.contains(ProfilerArgs::AdvancedMemory) || profiler.gc_alloc_stack_tracking {
-						any = true;
-
-						let alloc_cb: GCAllocCB;
-
-						if profiler.gc_alloc_stack_tracking {
-							if call_memory && args.contains(ProfilerArgs::AdvancedMemory)
-							{
-								alloc_cb = gc_alloc_cb::<true, true, true>;
-							}
-							else if call_memory
-							{
-								alloc_cb = gc_alloc_cb::<true, false, true>;
-							}
-							else // Only advanced memory
-							{
-								alloc_cb = gc_alloc_cb::<false, true, true>;
-							}
-						}
-						else if call_memory && args.contains(ProfilerArgs::AdvancedMemory)
-      					{
-      						alloc_cb = gc_alloc_cb::<true, true, false>;
-      					}
-      					else if call_memory
-      					{
-      						alloc_cb = gc_alloc_cb::<true, false, false>;
-      					}
-      					else // Only advanced memory
-      					{
-      						alloc_cb = gc_alloc_cb::<false, true, false>;
-      					}
-						mono_profiler_set_gc_allocation_callback(profiler.handle, Some(alloc_cb));
-					}
-
-					if args.contains(ProfilerArgs::GCEvent)
-					{
-						any = true;
-						mono_profiler_set_gc_event_callback(profiler.handle, Some(gc_collect_cb));
-					}
-
-					if !any
+					if !install_callbacks(profiler, args, sync.config.instrument_methods)
 					{
 						*state = false;
 						return ProfilerResultCode::InvalidArgs;
@@ -760,21 +691,8 @@ pub unsafe extern "system" fn profiler_toggle(
 				}
 				else
 				{
-					if profiler.gc_alloc_stack_tracking {
-						mono_profiler_set_gc_allocation_callback(
-							profiler.handle,
-							Some(gc_alloc_cb::<false, false, true>),
-						);
-					} else {
-						mono_profiler_set_gc_allocation_callback(profiler.handle, None);
-					}
+					uninstall_callbacks(profiler);
 					profiler.args = ProfilerArgs::None;
-					mono_profiler_set_method_enter_callback(profiler.handle, None);
-					mono_profiler_set_method_leave_callback(profiler.handle, None);
-					mono_profiler_set_method_exception_leave_callback(profiler.handle, None);
-					mono_profiler_set_gc_allocation_callback(profiler.handle, None);
-					mono_profiler_set_gc_event_callback(profiler.handle, None);
-					mono_profiler_set_exception_throw_callback(profiler.handle, None);
 				}
 				//println!("Profile complete");
 				let now = Instant::now();
@@ -941,6 +859,71 @@ pub unsafe extern "system" fn profiler_toggle(
 	}
 }
 
+unsafe fn install_callbacks(profiler: &MonoProfiler, args: ProfilerArgs, instrument_methods: bool) -> bool
+{
+	let stack = instrument_methods && args.contains(ProfilerArgs::Stack);
+	let call_memory = (stack || args.contains(ProfilerArgs::StackWalkAllocations)) && args.contains(ProfilerArgs::CallMemory);
+	let advanced_memory = args.contains(ProfilerArgs::AdvancedMemory);
+	let gc_events = args.contains(ProfilerArgs::GCEvent);
+
+	if !stack && !call_memory && !advanced_memory && !gc_events
+	{
+		return false;
+	}
+
+	let enter: EnterCB;
+	let exit: ExitCB;
+	let exception: ExceptionalExitCB;
+	if args.contains(ProfilerArgs::Timings) {
+		enter = method_enter::<true>;
+		exit = method_leave::<true>;
+		exception = method_exception_leave::<true>;
+	}
+	else
+	{
+		enter = method_enter::<false>;
+		exit = method_leave::<false>;
+		exception = method_exception_leave::<false>;
+	}
+	mono_profiler_set_method_enter_callback(profiler.handle, stack.then_some(enter));
+	mono_profiler_set_method_leave_callback(profiler.handle, stack.then_some(exit));
+	mono_profiler_set_method_exception_leave_callback(profiler.handle, stack.then_some(exception));
+	mono_profiler_set_exception_throw_callback(profiler.handle, stack.then_some(exception_thrown as ExceptionThrownCB));
+	mono_profiler_set_gc_allocation_callback(profiler.handle, allocation_callback(
+		call_memory,
+		advanced_memory,
+		profiler.gc_alloc_stack_tracking));
+	mono_profiler_set_gc_event_callback(profiler.handle, gc_events.then_some(gc_collect_cb as GCEventCB));
+
+	true
+}
+
+unsafe fn uninstall_callbacks(profiler: &MonoProfiler)
+{
+	mono_profiler_set_method_enter_callback(profiler.handle, None);
+	mono_profiler_set_method_leave_callback(profiler.handle, None);
+	mono_profiler_set_method_exception_leave_callback(profiler.handle, None);
+	mono_profiler_set_exception_throw_callback(profiler.handle, None);
+	mono_profiler_set_gc_event_callback(profiler.handle, None);
+	mono_profiler_set_gc_allocation_callback(profiler.handle, allocation_callback(
+		false,
+		false,
+		profiler.gc_alloc_stack_tracking));
+}
+
+fn allocation_callback(call: bool, advanced: bool, tracking: bool) -> Option<GCAllocCB>
+{
+	match (call, advanced, tracking) {
+		(false, false, false) => None,
+		(false, false, true) => Some(gc_alloc_cb::<false, false, true> as GCAllocCB),
+		(false, true, false) => Some(gc_alloc_cb::<false, true, false> as GCAllocCB),
+		(false, true, true) => Some(gc_alloc_cb::<false, true, true> as GCAllocCB),
+		(true, false, false) => Some(gc_alloc_cb::<true, false, false> as GCAllocCB),
+		(true, false, true) => Some(gc_alloc_cb::<true, false, true> as GCAllocCB),
+		(true, true, false) => Some(gc_alloc_cb::<true, true, false> as GCAllocCB),
+		(true, true, true) => Some(gc_alloc_cb::<true, true, true> as GCAllocCB)
+	}
+}
 
 /*pub unsafe fn debug_log_method(method: &MonoMethod)
 {
@@ -1062,10 +1045,6 @@ pub unsafe extern "C" fn gc_alloc_cb<const CALL: bool, const ADV: bool, const TR
 	profiler: &MonoProfiler,
 	object: &MonoObject,
 ) {
-	if !profiler.profiler_recording {
-		return;
-	}
-
 	let td = get_thread_data();
 	let alloc = mono_object_get_size(NonNull::from(object)) as u64;
 	if TRACKING {
@@ -1074,6 +1053,9 @@ pub unsafe extern "C" fn gc_alloc_cb<const CALL: bool, const ADV: bool, const TR
 				*alloc_frame += alloc;
 			}
 		}
+	}
+	if !profiler.profiler_recording {
+		return;
 	}
 	assert_main_domain!(profiler, td, ());
 	if CALL {
