@@ -116,14 +116,6 @@ impl MonoDefaults
 	}
 }
 
-unsafe impl Sync for MonoProfiler
-{
-
-}
-
-pub static mut PROFILER: Option<MonoProfiler> = None;
-
-
 bitflags! {
 	#[repr(transparent)]
 	pub struct CallInstrumentationFlags : u32

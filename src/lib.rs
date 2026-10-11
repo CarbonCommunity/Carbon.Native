@@ -6,6 +6,7 @@
  */
 
 use std::ffi::{c_char, CStr};
+use std::sync::RwLock;
 
 mod profiler;
 mod mono;
@@ -28,17 +29,24 @@ pub unsafe fn cptr_to_str<'a>(ptr: *mut c_char) -> &'a CStr
 #[no_mangle]
 pub unsafe extern "system" fn carbon_init_logger(log_method: Logger)
 {
-	LOG_METHOD = Some(log_method);
+	if let Ok(mut logger) = LOG_METHOD.write() {
+		*logger = Some(log_method);
+	}
 }
 
 pub type Logger = extern "system" fn(Severity, i32, *const u8, i32, LogSource);
 
-pub static mut LOG_METHOD: Option<Logger> = None;
+static LOG_METHOD: RwLock<Option<Logger>> = RwLock::new(None);
+
+fn logger() -> Option<Logger>
+{
+	LOG_METHOD.read().ok().and_then(|logger| *logger)
+}
 
 #[no_mangle]
 pub unsafe extern "system" fn log_message(level: Severity, verb: i32, ptr: *const u8, len: i32, source: LogSource)
 {
-	match LOG_METHOD.as_ref() {
+	match logger() {
 		None => (),
 		Some(x) => x(level, verb, ptr, len, source)
 	}
@@ -49,15 +57,6 @@ macro_rules! ok_or_ret {
 		match $expr {
 			Err(_) => {return $default;},
 			Ok(x) => x
-		}
-	};
-}
-#[macro_export]
-macro_rules! assert_main_domain {
-	($profiler:expr, $td:expr, $default:expr) => {
-		match $profiler.main_domain == $td.domain {
-			false => {return $default;},
-			true => {}
 		}
 	};
 }
@@ -89,17 +88,15 @@ pub unsafe fn read_cstr_default(ptr: *const c_char, default: impl FnOnce() -> St
 
 pub fn log_mono_internal(severity: Severity, msg: &str, source: LogSource, verb: i32)
 {
-	unsafe {
-		match LOG_METHOD.as_ref()
-		{
-			None => {
-				println!("{}", match source {
-					LogSource::Native => format!("[Carbon Native]: {msg}"),
-					LogSource::Profiler => format!("[Carbon Profiler]: {msg}"),
-				});
-			}
-			Some(x) => x(severity, verb, msg.as_ptr(), msg.len() as i32, source)
+	match logger()
+	{
+		None => {
+			println!("{}", match source {
+				LogSource::Native => format!("[Carbon Native]: {msg}"),
+				LogSource::Profiler => format!("[Carbon Profiler]: {msg}"),
+			});
 		}
+		Some(x) => x(severity, verb, msg.as_ptr(), msg.len() as i32, source)
 	}
 }
 

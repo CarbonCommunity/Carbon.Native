@@ -296,6 +296,11 @@ impl AllocationScopes
 		self.scopes.pop().unwrap_or_default()
 	}
 
+	pub fn is_tracking(&self) -> bool
+	{
+		self.overflow == 0 && !self.scopes.is_empty()
+	}
+
 	pub fn allocation(&mut self, size: u64)
 	{
 		if self.overflow == 0 {
@@ -484,6 +489,7 @@ mod tests {
 			assert!(scopes.push());
 		}
 		assert!(!scopes.push());
+		assert!(!scopes.is_tracking());
 		scopes.allocation(5);
 		assert_eq!(scopes.pop(), 0);
 		scopes.allocation(5);
