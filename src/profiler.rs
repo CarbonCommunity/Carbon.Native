@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::hash_map::Iter;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -211,8 +210,6 @@ pub struct ProfilerSynced
 {
 	pub config: ProfilerConfig,
 	pub profiler_images: FxHashSet<*const MonoImage>,
-	pub profiler_method_image_map: HashMap<*const MonoMethod, *const MonoImage>,
-	pub profiler_method_detour_map: HashMap<*const MonoMethod, *const MonoMethod>,
 	pub runtime: Option<RuntimeData>,
 }
 
@@ -343,8 +340,6 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 			sync: Mutex::new(ProfilerSynced {
 				config: cfg,
 				profiler_images: Default::default(),
-				profiler_method_image_map: Default::default(),
-				profiler_method_detour_map: Default::default(),
 				runtime: None,
 			}),
 			mono_defaults: MonoDefaults::new(),
@@ -946,13 +941,6 @@ pub unsafe extern "C" fn can_profile_method(profiler: &MonoProfiler, method: *co
 		return CallInstrumentationFlags::None;
 	}
 	let sync = ok_or_ret!(profiler.sync.lock(), CallInstrumentationFlags::None);
-	/*match sync.profiler_method_detour_map.get(&(method as *const MonoMethod))
-	{
-		None => {}
-		Some(x) => {
-			method = &**x;
-		}
-	}*/ // not used
 	let class = mono_method_get_class(method);
 	let asm: *const MonoImage = mono_class_get_image(class);
 	if mono_class_get_type_token(class) == 0x02000001 {

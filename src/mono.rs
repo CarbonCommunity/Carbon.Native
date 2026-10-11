@@ -9,22 +9,6 @@ use std::ffi::c_char;
 use std::mem::transmute;
 
 use bitflags::bitflags;
-#[cfg(target_os = "linux")]
-use libc::ucontext_t;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
-#[cfg(target_os = "windows")]
-pub type ThreadContext = CONTEXT;
-#[cfg(target_os = "linux")]
-pub type ThreadContext = ucontext_t;
-
-#[cfg(target_os = "linux")]
-use libc::pthread_t;
-#[cfg(target_os = "windows")]
-pub type SysThread = *const ();
-#[cfg(target_os = "linux")]
-pub type SysThread = pthread_t;
-
 
 use crate::profiler::MonoProfiler;
 use crate::read_cstr;
@@ -47,8 +31,6 @@ extern "C" {
 	pub fn mono_image_get_name(image: *const MonoImage) -> *const c_char;
 	#[link_name = "mono_object_get_size_internal"]
 	pub fn mono_object_get_size(object: *const MonoObject) -> u32;
-	#[link_name = "mono_stack_walk_async_safe"]
-	pub fn __internal_mono_stack_walk_async_safe(func: *const (), ctx: &ThreadContext, ud: *mut ());
 	#[link_name = "mono_stack_walk"]
 	pub fn __internal_mono_stack_walk(func: *const (), ud: *mut ());
 	#[link_name = "mono_stack_walk_no_il"]
@@ -79,14 +61,7 @@ pub unsafe fn mono_free_g<T>(ptr: *mut T)
 	__internal__mono_free(transmute(ptr));
 }
 
-pub type AsyncStackWalkFunc<T> = unsafe extern "C" fn(Option<&MonoMethod>, *const MonoDomain, ji_code_start: *const (), native_offset: i32, userdata: &mut T) -> bool;
 pub type StackWalkFunc<T> = unsafe extern "C" fn(*const MonoMethod, native_offset: i32, il_offset: i32, is_managed: MonoBool, userdata: &mut T) -> MonoBool;
-
-#[inline]
-pub unsafe fn mono_stack_walk_async<T>(cb: AsyncStackWalkFunc<T>, ctx: &ThreadContext, data: &mut T)
-{
-	__internal_mono_stack_walk_async_safe(cb as *const (), ctx, data as *mut T as *mut ());
-}
 
 #[inline]
 pub unsafe fn mono_stack_walk<const NO_IL: bool, T>(cb: StackWalkFunc<T>, data: &mut T)

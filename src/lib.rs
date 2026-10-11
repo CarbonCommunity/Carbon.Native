@@ -20,12 +20,6 @@ pub unsafe extern "system" fn carbon_get_protocol() -> u64
 	PROTOCOL
 }
 
-#[inline]
-pub unsafe fn cptr_to_str<'a>(ptr: *mut c_char) -> &'a CStr
-{
-	CStr::from_ptr(ptr)
-}
-
 #[no_mangle]
 pub unsafe extern "system" fn carbon_init_logger(log_method: Logger)
 {
