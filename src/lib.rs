@@ -69,21 +69,12 @@ macro_rules! some_or_ret {
 		}
 	};
 }
-#[macro_export]
-macro_rules! deref_or_ret {
-	($expr:expr, $default:expr) => {
-		match $expr.is_null() {
-			false => &*$expr,
-			true => {return $default;}
-		}
-	};
-}
 
-pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a str>
+pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> Option<&'a CStr>
 {
 	match ptr.is_null()  {
 		true => None,
-		false => Some(CStr::from_ptr(ptr).to_str().unwrap())
+		false => Some(CStr::from_ptr(ptr))
 	}
 }
 
@@ -91,13 +82,8 @@ pub unsafe fn read_cstr_default(ptr: *const c_char, default: impl FnOnce() -> St
 {
 	match read_cstr(ptr)  {
 		None => default(),
-		Some(x) => x.to_string()
+		Some(x) => x.to_string_lossy().into_owned()
 	}
-}
-
-pub unsafe fn read_cstr_default_static(ptr: *const c_char, default: &'static str) -> &str
-{
-	read_cstr(ptr).unwrap_or(default)
 }
 
 pub fn log_mono_internal(severity: Severity, msg: &str, source: LogSource, verb: i32)
