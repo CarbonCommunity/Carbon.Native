@@ -9,6 +9,7 @@ use std::ffi::{c_char, CStr};
 
 mod profiler;
 mod mono;
+mod recording;
 
 pub const PROTOCOL: u64 = 4;
 
@@ -143,12 +144,4 @@ pub enum LogSource
 {
 	Native,
 	Profiler
-}
-
-#[cfg(test)]
-mod tests {
-	#[test]
-	fn test() {
-
-	}
 }
