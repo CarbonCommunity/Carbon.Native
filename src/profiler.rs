@@ -161,6 +161,8 @@ pub struct MonoProfiler
 	pub freed_methods: Mutex<FxHashSet<*const MonoMethod>>,
 	pub epoch: Instant,
 	pub gc: GcClock,
+	pub allocations_enabled: AtomicBool,
+	pub filter_installed: AtomicBool,
 }
 
 unsafe impl Send for MonoProfiler {}
@@ -203,6 +205,20 @@ impl MonoProfiler
 		let slot = Arc::new(ThreadSlot::new(main));
 		self.threads.lock().unwrap_or_else(PoisonError::into_inner).push(slot.clone());
 		slot
+	}
+
+	unsafe fn enable_allocations(&self)
+	{
+		if !self.allocations_enabled.swap(true, Ordering::Relaxed) && mono_profiler_enable_allocations() == 0 {
+			log_mono_native_host(Severity::Warning, "Mono refused to enable allocation events; memory profiling records nothing");
+		}
+	}
+
+	unsafe fn install_filter(&self)
+	{
+		if !self.filter_installed.swap(true, Ordering::Relaxed) {
+			mono_profiler_set_call_instrumentation_filter_callback(self.handle(), Some(can_profile_method));
+		}
 	}
 }
 
@@ -329,6 +345,7 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 		//init_detour();
 
 		let instrument_methods = cfg.instrument_methods;
+		let has_assemblies = !cfg.assemblies.is_empty();
 
 		let mp = PROFILER.get_or_init(|| MonoProfiler {
 			main_domain: mono_domain_get(),
@@ -346,7 +363,9 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 			threads: Mutex::new(Vec::new()),
 			freed_methods: Mutex::new(FxHashSet::default()),
 			epoch: Instant::now(),
-			gc: GcClock::default()
+			gc: GcClock::default(),
+			allocations_enabled: AtomicBool::new(false),
+			filter_installed: AtomicBool::new(false)
 		});
 
 		#[cfg(debug_assertions)]
@@ -361,11 +380,10 @@ pub unsafe extern "system" fn init_profiler(cfg_ptr: *const u16, cfg_len: i32)
 		let handle = mono_profiler_create(ptr::from_ref(mp).cast_mut());
 		mp.handle.store(handle.cast_mut(), Ordering::Relaxed);
 
-		mono_profiler_enable_allocations();
 		mono_profiler_set_method_free_callback(handle, Some(method_free));
 
-		if instrument_methods {
-			mono_profiler_set_call_instrumentation_filter_callback(handle, Some(can_profile_method));
+		if instrument_methods && has_assemblies {
+			mp.install_filter();
 			mono_profiler_set_image_loaded_callback(handle, Some(image_loaded));
 		}
 		#[cfg(debug_assertions)]
@@ -402,6 +420,9 @@ pub unsafe extern "system" fn register_profiler_assembly(image: *const MonoImage
 		println!("registering assembly from managed: {}", get_assembly_name(image));
 	}
 	sync.profiler_images.insert(image);
+	if sync.config.instrument_methods {
+		profiler.install_filter();
+	}
 }
 
 pub const IMAGE_BLACKLIST: &[&str] = &["UnityEngine.CoreModule"];
@@ -620,6 +641,9 @@ pub unsafe extern "C" fn enable_method_alloc_stack(toggle: bool) -> ProfilerResu
 	}
 	if profiler.gc_alloc_stack_tracking.load(Ordering::Relaxed) == toggle {
 		return ProfilerResultCode::NoOp;
+	}
+	if toggle {
+		profiler.enable_allocations();
 	}
 	profiler.gc_alloc_stack_tracking.store(toggle, Ordering::Relaxed);
 	mono_profiler_set_gc_allocation_callback(profiler.handle(), allocation_callback(false, false, toggle));
@@ -887,6 +911,9 @@ unsafe fn install_callbacks(profiler: &MonoProfiler, args: ProfilerArgs, instrum
 	mono_profiler_set_method_leave_callback(profiler.handle(), stack.then_some(method_leave as ExitCB));
 	mono_profiler_set_method_exception_leave_callback(profiler.handle(), stack.then_some(method_exception_leave as ExceptionalExitCB));
 	mono_profiler_set_exception_throw_callback(profiler.handle(), stack.then_some(exception_thrown as ExceptionThrownCB));
+	if call_memory || advanced_memory {
+		profiler.enable_allocations();
+	}
 	mono_profiler_set_gc_allocation_callback(profiler.handle(), allocation_callback(
 		call_memory,
 		advanced_memory,
